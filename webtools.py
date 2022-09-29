@@ -381,7 +381,7 @@ class ChromeDriver:
             sokoban_element_strings = [str(x) for x in sokoban_elements]
             img_tags = [str(x.select('img')) for x in sokoban_elements]
             list_of_img_src_strings = [x.split('src="')[-1].split(' ')[0].split(' ')[0].split('"/>')[0].strip().replace('"','') for x in img_tags]
-            # print('list_of_img_src_strings: ', list_of_img_src_strings)
+            print('list_of_img_src_strings: ', list_of_img_src_strings)
             list_of_img_alt_strings = [x.split('img alt="')[-1].split('" c')[0].strip() for x in img_tags]
             print('list_of_img_alt_strings: ', list_of_img_alt_strings)
             href_list = [x.split('<a href="')[-1].split('" ping')[0] for x in sokoban_element_strings]
@@ -936,6 +936,20 @@ class ChromeDriver:
                                     logger.info('Could not click on the -I Agree- button. Error message: ' + str(e))
                     except:
                         pass
+                    try:
+                        buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Accept all')]")
+                        if len(buttons) > 0:
+                            for current_button in buttons:
+                                try:
+                                    actions = ActionChains(self.driver)
+                                    actions.move_to_element(current_button)
+                                    actions.perform()
+                                    current_button.click()
+                                    logger.info('Had to click -Accept all- button. Done successfully.')
+                                except BaseException as e:
+                                    logger.info('Could not click on the -Accept all- button. Error message: ' + str(e))
+                    except:
+                        pass
                     logger.info('Trying to select "Search by Image" button...')
                     search_by_image_button = self.driver.find_elements(By.CSS_SELECTOR, "[aria-label='Search by image']")
                     actions = ActionChains(self.driver)
@@ -968,8 +982,10 @@ class ChromeDriver:
                                 logger.info('Sent file path to file selector control!')
                             except:
                                 pass
-                    time.sleep(random.uniform(0.9, 1.2))
+                    time.sleep(random.uniform(2.5, 5))
                     logger.info('Now attempting to click "Find image source" button...')
+                    WebDriverWait(self.driver, 15).until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@aria-label, 'Find image source')]")))
+                    #WebDriverWait(self.driver, 15).until(lambda wd: wd.find_element(By.XPATH,  "//a[contains(@aria-label, 'Find image source')]"))
                     find_image_source_buttons = self.driver.find_elements(By.XPATH, "//a[contains(@aria-label, 'Find image source')]")
                     for current_button in find_image_source_buttons:
                         try:
@@ -981,7 +997,7 @@ class ChromeDriver:
                             logger.info('Clicked "Find image source" button!')
                             self.driver.switch_to.window(self.driver.window_handles[-1])
                             status_result = 1
-                        except:
+                        except BaseException as e:
                             logger.info('Error message: ' + str(e))
                             pass
                 except BaseException as e:
@@ -1042,6 +1058,20 @@ class ChromeDriver:
                     if len(buttons) > 0:
                         buttons[0].click()
                         logger.info('Had to click -I agree- box. Done successfully.')
+                except:
+                    pass
+                try:
+                    buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Accept all')]")
+                    if len(buttons) > 0:
+                        for current_button in buttons:
+                            try:
+                                actions = ActionChains(self.driver)
+                                actions.move_to_element(current_button)
+                                actions.perform()
+                                current_button.click()
+                                logger.info('Had to click -Accept all- button. Done successfully.')
+                            except BaseException as e:
+                                logger.info('Could not click on the -Accept all- button. Error message: ' + str(e))
                 except:
                     pass
                 time.sleep(random.uniform(0.3, 0.6))
@@ -1170,3 +1200,12 @@ class ChromeDriver:
         except BaseException as e:
             logger.error('Encountered Error getting number of pages of search results: ' + str(e))
         return number_of_pages_of_results
+    
+    
+    
+    
+    
+    
+    
+    
+    
