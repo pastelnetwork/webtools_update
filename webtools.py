@@ -618,9 +618,14 @@ class ChromeDriver:
             try:
                 self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 try:
-                    next_page_elements = self.driver.find_elements(By.XPATH, "//a[contains(@id,'next')]")
-                    if len(next_page_elements) > 0:
-                        next_page_elements[0].click()
+                    if current_page == 0:
+                        next_page_elements = self.driver.find_elements(By.CSS_SELECTOR, "[aria-label='Next page']")
+                        if len(next_page_elements) > 0:
+                            next_page_elements[0].click()
+                    else:
+                        next_page_elements = self.driver.find_elements(By.XPATH, "//a[contains(@id,'next')]")
+                        if len(next_page_elements) > 0:
+                            next_page_elements[0].click()
                 except:
                     try:
                         next_page_elements = self.driver.find_elements(By.ID, "pnnext")
@@ -1177,6 +1182,9 @@ class ChromeDriver:
         number_of_pages_of_results = 1
         try:
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            initial_next_page_button_element = self.driver.find_elements(By.CSS_SELECTOR, "[aria-label='Next page']")
+            if len(initial_next_page_button_element)> 0:
+                initial_next_page_button_element[0].click()
             list_of_search_results_start_strings = list()
             url_elements_on_page = self.driver.find_elements(By.XPATH, "//a[@href]")
             for indx, elem in enumerate(url_elements_on_page):
@@ -1197,6 +1205,8 @@ class ChromeDriver:
                  number_of_pages_of_results__method_3])
             logger.info('Counted ' + str(
                 number_of_pages_of_results) + ' pages of Google search results for reverse image query!')
+            self.driver.back()
+
         except BaseException as e:
             logger.error('Encountered Error getting number of pages of search results: ' + str(e))
         return number_of_pages_of_results
