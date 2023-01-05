@@ -1,8 +1,28 @@
-# Copyright (c) 2021-2021 The Pastel Core developers
+# Copyright (c) 2021-2023 The Pastel Core developers
 # Distributed under the MIT software license, see the accompanying
-# file COPYING or http://www.opensource.org/licenses/mit-license.php.
+# file COPYING or https://www.opensource.org/licenses/mit-license.php.
 import io
-import os, time, socket, hashlib, shutil, urllib.request, re, random, base64, json, pathlib
+import os
+import time
+import socket
+import hashlib
+import shutil
+import psutil
+import urllib.request
+import re
+import random
+import base64
+import json
+from pathlib import Path
+import threading
+from datetime import datetime
+import datefinder
+import requests
+from html.parser import HTMLParser
+from html import unescape
+import zstandard as zstd
+from contextlib import contextmanager
+import _thread
 
 import chromedriver_autoinstaller
 from PIL import Image
@@ -11,38 +31,25 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException
 import pandas as pd
+import pyimgur
+from fuzzywuzzy import process
+import torch
+from torch import nn
+from torch.utils.data import Dataset
+import torchvision
+import torchvision.transforms
+import faiss
+import h5py
+import numpy as np
+from bs4 import BeautifulSoup
 
 from lib.utils import DDImage, MyTimer
 from lib.logger import logger
 from lib.config import Config
-from datetime import datetime
-import datefinder
-import requests
-from html.parser import HTMLParser
-from html import unescape
-import pyimgur
-from fuzzywuzzy import process
-
-import torch
 from lib import models
 from lib.models.gem import GeneralizedMeanPoolingP
-import torchvision
-import torchvision.transforms
-from torch import nn
-from torch.utils.data import Dataset
-import faiss
-import h5py
-import numpy as np
-from selenium.common.exceptions import NoSuchElementException
-import re
-import zstandard as zstd
-from bs4 import BeautifulSoup
-
-import traceback
-from contextlib import contextmanager
-import threading
-import _thread
 
 CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
@@ -85,11 +92,9 @@ def get_sha256_hash_of_input_data_func(input_data_or_string):
     return sha256_hash_of_input_data
 
 
-def get_image_hash_from_image_file_path_func(path_to_art_image_file):
+def get_image_hash_from_image_file_path_func(art_image_file: Path):
     try:
-        with open(path_to_art_image_file, 'rb') as f:
-            art_image_file_binary_data = f.read()
-        sha256_hash_of_art_image_file = get_sha256_hash_of_input_data_func(art_image_file_binary_data)
+        sha256_hash_of_art_image_file = get_sha256_hash_of_input_data_func(art_image_file.read_bytes())
         return sha256_hash_of_art_image_file
     except Exception as e:
         logger.error('Error: ' + str(e))
@@ -148,7 +153,7 @@ def generate_rare_on_internet_graph_func(combined_summary_df, rare_on_internet__
                                         date_string=image_label_to_dates_dict[label1],
                                         )]
         except BaseException as e:
-            logger.error('Encountered error adding node to rare on internet graph structure: ' + str(e))
+            logger.exception('Encountered error adding node to rare on internet graph structure')
         for jj, label2 in enumerate(list_of_image_labels):
             current_adjacency = rare_on_internet__adjacency_df.iloc[ii, jj]
             if current_adjacency and label1 != label2:
@@ -156,7 +161,7 @@ def generate_rare_on_internet_graph_func(combined_summary_df, rare_on_internet__
                     cntr = cntr + 1
                     links_list = links_list + [dict(source=ii, target=jj, connection_strength=str(rare_on_internet__similarity_df.loc[label1, label2]))]
                 except BaseException as e:
-                    logger.error('Encountered error adding link to rare on internet graph structure: ' + str(e))     
+                    logger.exception('Encountered error adding link to rare on internet graph structure')
     current_graph = {'nodes': nodes_list, 'links': links_list}
     #print('current_graph', current_graph)
     current_graph_json = json.dumps(current_graph)
@@ -186,7 +191,7 @@ def generate_alt_rare_on_internet_graph_func(list_of_images_as_base64__filtered,
                                             img_alt=image_label_to_img_alt_dict[label1],
                                             )]
         except BaseException as e:
-            logger.error('Encountered error adding node to alternative rare on internet graph structure: ' + str(e))
+            logger.exception('Encountered error adding node to alternative rare on internet graph structure')
         for jj, label2 in enumerate(list_of_image_labels):
             current_adjacency = alt_rare_on_internet__adjacency_df.iloc[ii, jj]
             if current_adjacency and label1 != label2:
@@ -194,7 +199,7 @@ def generate_alt_rare_on_internet_graph_func(list_of_images_as_base64__filtered,
                     cntr = cntr + 1
                     links_list = links_list + [dict(source=ii, target=jj, connection_strength=str(alt_rare_on_internet__similarity_df.loc[label1, label2]))]
                 except BaseException as e:
-                    logger.error('Encountered error adding link to alternative rare on internet graph structure: ' + str(e))                    
+                    logger.exception('Encountered error adding link to alternative rare on internet graph structure')
     current_graph = {'nodes': nodes_list, 'links': links_list}
     current_graph_json = json.dumps(current_graph)
     return current_graph_json
@@ -208,6 +213,8 @@ def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
 
 
 class ChromeDriver:
+    WEBTOOLS_VERSION = "1.0"
+    MAX_SEARCH_RESULTS = 50
 
     def __init__(self, config: Config, img: DDImage):
         chromedriver_autoinstaller.install()
@@ -219,20 +226,21 @@ class ChromeDriver:
         chrome_options.add_argument("--start-maximized")
         chrome_options.add_argument("--disable-backgrounding-occluded-windows")
         chrome_options.add_experimental_option("useAutomationExtension", False)
-        prefs = {"download.default_directory": config.internet_rareness_downloaded_images_path}
+        prefs = {"download.default_directory": str(config.internet_rareness_downloaded_images_path)}
         chrome_options.add_experimental_option("prefs", prefs)
         self.resized_image_save_path = None
         self.driver = webdriver.Chrome(options=chrome_options)  # executable_path=chromedriver_path,
         # self.driver.implicitly_wait(3)
         self.config = config
         self.img = img
+        logger.info(f'Initialized webtools v{self.WEBTOOLS_VERSION}')
         
     def filter_out_dissimilar_images_func(self, list_of_images_as_base64):
         logger.info("Now filtering out dissimilar images from google image results...")
         model = models.create("resnet50", num_features=0, dropout=0, num_classes=4)
         model = nn.DataParallel(model)
         model.module.classifier = None
-        checkpoint_file = self.config.support_files_path + 'DupeDetector_gray.pth.tar'
+        checkpoint_file = str(self.config.support_files_path / 'DupeDetector_gray.pth.tar')
         print("Loading checkpoint... ", checkpoint_file)
         ckpt = torch.load(checkpoint_file)
         model.load_state_dict(ckpt,strict = True)
@@ -261,9 +269,6 @@ class ChromeDriver:
             return img
         
         def base64_to_preimage(base64_str):
-            from PIL import Image
-            import base64
-            import io
             imgdata = base64.b64decode(base64_str)
             return io.BytesIO(imgdata)
         
@@ -288,30 +293,43 @@ class ChromeDriver:
             return names, np.vstack(descs)
         
         all_desc_q = []
-        features = model.module.base(preprocess_image(self.resized_image_save_path))
+        features = model.module.base(preprocess_image(str(self.resized_image_save_path)))
         features = features.view(features.size(0), -1)
         all_desc_q.append(features)
         all_desc_q = torch.vstack(tuple(all_desc_q)).cpu().detach().numpy()
         logger.info("Load PCA matrix q")
-        pca = faiss.read_VectorTransform(self.config.support_files_path + 'pca_bw.vt')
+        pca = faiss.read_VectorTransform(str(self.config.support_files_path / 'pca_bw.vt'))
         print(f"Apply PCA q {pca.d_in} -> {pca.d_out}")
         all_desc_q = pca.apply_py(all_desc_q)
-        logger.info("normalizing descriptors q")
+        logger.info(f"RAM used {psutil.virtual_memory()[3]}")
+        logger.info(f"normalizing descriptors q {all_desc_q.shape}")
         faiss.normalize_L2(all_desc_q)
-        all_desc_q.resize((all_desc_q.shape[1], all_desc_q.shape[0]))
+        logger.info("after q normalization")
+        logger.info(f"RAM used {psutil.virtual_memory()[3]}")
+        all_desc_q = all_desc_q.transpose()
+        logger.info(f"RAM used {psutil.virtual_memory()[3]}")
         print("The shape of feature is q", all_desc_q.shape)
         print("all_desc_q", all_desc_q)
         all_desc_r = []
-        for r_str in range(len(list_of_images_as_base64)):
+        img_count = len(list_of_images_as_base64)
+        logger.info(f"pre-processing {img_count} images")
+        mem_size = psutil.virtual_memory()[3]
+        for r_str in range(img_count):
+            logger.info(f"img {r_str + 1}/{img_count}")
             features = model.module.base(preprocess_image(base64_to_preimage(list_of_images_as_base64[r_str])))
+            list_of_images_as_base64[r_str] = None
             features = features.view(features.size(0), -1)
+            mem_size_old = mem_size
+            mem_size = psutil.virtual_memory()[3]
+            logger.info(f"RAM used {mem_size}, delta={mem_size - mem_size_old}")
             all_desc_r.append(features)
+        logger.info(f"RAM used {psutil.virtual_memory()[3]}")
         all_desc_r = torch.vstack(tuple(all_desc_r)).cpu().detach().numpy()
         logger.info("Load PCA matrix r")
-        pca = faiss.read_VectorTransform(self.config.support_files_path + 'pca_bw.vt')
+        pca = faiss.read_VectorTransform(str(self.config.support_files_path / 'pca_bw.vt'))
         print(f"Apply PCA q {pca.d_in} -> {pca.d_out}")
         all_desc_r = pca.apply_py(all_desc_r)
-        logger.info("normalizing descriptors r")
+        logger.info(f"normalizing descriptors r {all_desc_r.shape}")
         faiss.normalize_L2(all_desc_r)
         print("The shape of feature is r", all_desc_r.shape)
         print("all_desc_r", all_desc_r)
@@ -319,12 +337,13 @@ class ChromeDriver:
         for iu in range(len(cos_scores)):
             print("The cos_scores are",cos_scores[iu])
         numpy_feature_of_query = all_desc_q.reshape(1, all_desc_q.shape[0])
+        logger.info(f"RAM used {psutil.virtual_memory()[3]}")
         print("Now calculating similarity matrix of rare on the internet images...")
         rare_on_internet__cos_similarity_matrix = all_desc_r @ (all_desc_r.T)
         
         rare_on_internet__cos_similarity_matrix_df = pd.DataFrame(rare_on_internet__cos_similarity_matrix)
         rare_on_internet__cos_similarity_matrix_df = rare_on_internet__cos_similarity_matrix_df.round(8)
-        train_image_ids, xt = read_descriptors([self.config.support_files_path + 'train_0_bw.hdf5'])
+        train_image_ids, xt = read_descriptors([str(self.config.support_files_path / 'train_0_bw.hdf5')])
         index = faiss.IndexFlatIP(xt.shape[1])
         index.add(xt)
         train_scores, I = index.search(numpy_feature_of_query.astype('float32'), 10)
@@ -333,7 +352,7 @@ class ChromeDriver:
         min_normalized_cos_similarity_threshold__lowest_permissible = -0.18
         target_pct_of_results_to_keep = 0.35
         print('Target percentage of results to keep: ', target_pct_of_results_to_keep)
-        if len(list_of_images_as_base64) >= 3:
+        if img_count >= 3:
             min_normalized_cos_similarity_threshold = 0.0
             number_of_images_above_similarity_threshold = np.sum([(x > min_normalized_cos_similarity_threshold).astype(int) for idx, x in enumerate(cos_scores)])
             pct_of_images_above_similarity_threshold = number_of_images_above_similarity_threshold / len(cos_scores)
@@ -381,18 +400,18 @@ class ChromeDriver:
             sokoban_element_strings = [str(x) for x in sokoban_elements]
             img_tags = [str(x.select('img')) for x in sokoban_elements]
             list_of_img_src_strings = [x.split('src="')[-1].split(' ')[0].split(' ')[0].split('"/>')[0].strip().replace('"','') for x in img_tags]
-            print('list_of_img_src_strings: ', list_of_img_src_strings)
-            list_of_img_alt_strings = [x.split('img alt="')[-1].split('" c')[0].strip() for x in img_tags]
-            print('list_of_img_alt_strings: ', list_of_img_alt_strings)
+            print(f'list_of_img_src_strings ({len(list_of_img_src_strings)}): {[len(s) for s in list_of_img_src_strings]}')
+            list_of_img_alt_strings = [x.split('img alt="')[-1].split('" ')[0].strip() for x in img_tags]
+            print(f'list_of_img_alt_strings ({len(list_of_img_alt_strings)}): {[len(s) for s in list_of_img_alt_strings]}')
             href_list = [x.split('<a href="')[-1].split('" ping')[0] for x in sokoban_element_strings]
             sokoban_elements_more = [list(x.children)[0] for x in div_elements_filtered2]
             sokoban_element_more_strings = [str(x) for x in sokoban_elements_more]
             list_of_resolution_strings = [x.split('×')[0].split('<span>')[-1] + '×' + x.split('×')[-1].split('</span>')[0] for x in sokoban_element_more_strings]
-            print('list_of_resolution_strings: ', list_of_resolution_strings)
+            print(f'list_of_resolution_strings: {type(list_of_resolution_strings)}')
         except BaseException as e:
-            logger.error('Encountered Error on the first pass of getting Rare on the Internet data using normal method, now trying again with other approach! Error: ' + str(e))
+            logger.exception('Encountered Error on the first pass of getting Rare on the Internet data using normal method, now trying again with other approach!')
             page_source_text = self.driver.page_source
-            problem_files_path = pathlib.Path(self.config.support_files_path + 'rare_on_the_internet_problem_pages/')
+            problem_files_path = self.config.support_files_path / 'rare_on_the_internet_problem_pages'
             problem_files_path.mkdir(parents=True, exist_ok=True)
             self.remove_old_rare_on_internet_diagnostic_files_func(problem_files_path)
             problem_page_output_path = str(problem_files_path) + '/main_code__problem_page__' + datetime.now().strftime("%Y_%m_%d__%H_%M_%S") + '.html'
@@ -405,9 +424,9 @@ class ChromeDriver:
             list_of_date_strings = [list(set(list(datefinder.find_dates(x)))) for x in sokoban_element_more_strings]
             list_of_date_strings_fixed = [x[0].isoformat().split('T0')[0].replace(' ','_').replace(':','_') if len(x) > 0 else '' for x in list_of_date_strings]
         except BaseException as e:
-            logger.error('Error encountered parsing dates in the rare on the internet results-- trying again a different way...' + str(e))
+            logger.exception('Error encountered parsing dates in the rare on the internet results-- trying again a different way...')
             page_source_text = self.driver.page_source
-            problem_files_path = pathlib.Path(self.config.support_files_path + 'rare_on_the_internet_problem_pages/')
+            problem_files_path = self.config.support_files_path / 'rare_on_the_internet_problem_pages'
             problem_files_path.mkdir(parents=True, exist_ok=True)
             self.remove_old_rare_on_internet_diagnostic_files_func(problem_files_path)
             problem_page_output_path = str(problem_files_path) + '/main_code__problem_page__' + datetime.now().strftime("%Y_%m_%d__%H_%M_%S") + '.html'
@@ -467,7 +486,7 @@ class ChromeDriver:
             current_page_results_df = current_page_results_df[current_page_results_df['google_cached_url']!='']
             status = 1
         except BaseException as e:
-            logger.error('Encountered Error getting rare on the internet using normal method, trying again with other approach! Error: ' + str(e))
+            logger.exception('Encountered Error getting rare on the internet using normal method, trying again with other approach!')
             status, current_page_results_df = self.try_to_get_table_from_page_old()
             return status, current_page_results_df    
         return status, current_page_results_df
@@ -478,13 +497,13 @@ class ChromeDriver:
         try: #Wait until there are at least three visible images in the search results page (not necessarily three actual results). This will be true because of the Visually similar images section even if there are no real results.
             WebDriverWait(self.driver, 10).until(lambda wd: len([el for el in wd.find_element(By.ID,"search").find_elements(By.XPATH,'.//img') if el.is_displayed()])>3)
         except Exception as e: 
-            logger.error('Error encountered trying to find the "search" element on the page using the ID field...' + str(e))
+            logger.exception('Error encountered trying to find the "search" element on the page using the ID field...')
         try:
             search_element = self.driver.find_element(By.ID, 'search')
         except BaseException as e:
-            logger.error('Error encountered trying to select the "search" element on the page using the ID field...' + str(e))
+            logger.exception('Error encountered trying to select the "search" element on the page using the ID field...')
             page_source_text = self.driver.page_source
-            problem_files_path = pathlib.Path(self.config.support_files_path + 'rare_on_the_internet_problem_pages/')
+            problem_files_path = self.config.support_files_path / 'rare_on_the_internet_problem_pages'
             problem_files_path.mkdir(parents=True, exist_ok=True)
             self.remove_old_rare_on_internet_diagnostic_files_func(problem_files_path)
             problem_page_output_path = str(problem_files_path) + '/fallback_code__problem_page__' + datetime.now().strftime("%Y_%m_%d__%H_%M_%S") + '.html'
@@ -505,14 +524,17 @@ class ChromeDriver:
                         print('Index: ', idx)
                         soup = BeautifulSoup(current_result_group_html, "html.parser")
                         title_element = soup.find('h3')
-                        print('title: ', title_element.text)
+                        if title_element:
+                            print('title: ', title_element.text)
+                        else:
+                            raise NoSuchElementException('Image title not found')
                         soup_text = soup.get_text()
                         list_of_a_elements = soup.find_all('a')
                         list_of_href_elements = list(set([x.get('href') for x in list_of_a_elements if re.match("^http",x.get('href')) != None ]))
                         print("list of href elements: ",("\n\t").join(list_of_href_elements))
                         cached_url = ''
                         primary_url = ''
-                        if(len(list_of_href_elements) < 1 or len(list_of_href_elements)>2):
+                        if len(list_of_href_elements) < 1 or len(list_of_href_elements) > 2:
                             print("************WARNING: strange length of href elements in results div, refusing to continue************")
                             pass
                         for elem in list_of_href_elements:
@@ -533,16 +555,18 @@ class ChromeDriver:
                             resolution = str(s.group())
                         print("resolution: ", resolution)
                         date = ''
+                        date_string_fixed = ''
                         if('—' in description):
                             date_string = list(set(list(datefinder.find_dates(description))))
                             if len(date_string) > 0:
                                 date_string_fixed = date_string[0].isoformat().split('T0')[0].replace(' ','_').replace(':','_')
-                            else:
-                                date_string_fixed = ''
                         print("Date: ", date_string_fixed)
                         img = soup.find("img")
                         alt = img.find("alt")
-                        print("img: ", img)
+                        if img:
+                            print("img: ", img)
+                        else:
+                            raise NoSuchElementException('img not found')
                         img_src = img["src"]
                         img_alt = img["alt"]
                         list_of_lists.append([title_element.text, description, primary_url, cached_url, date_string_fixed,  resolution, img_alt, img_src])
@@ -554,7 +578,7 @@ class ChromeDriver:
         if len(df) == 0:
             logger.info('Error encountered using fallback Rare on the Internet code...')
             page_source_text = self.driver.page_source
-            problem_files_path = pathlib.Path(self.config.support_files_path + 'rare_on_the_internet_problem_pages/')
+            problem_files_path = self.config.support_files_path / 'rare_on_the_internet_problem_pages'
             problem_files_path.mkdir(parents=True, exist_ok=True)
             problem_page_output_path = str(problem_files_path) + '/main_code__problem_page__' + datetime.now().strftime("%Y_%m_%d__%H_%M_%S") + '.html'
             print('\nSaving problem page to disk for analysis: ' + problem_page_output_path)
@@ -585,7 +609,7 @@ class ChromeDriver:
                     [max_number_of_pages_of_results_to_get, number_of_pages_of_results_available])
                 logger.info('Attempting to get ' + str(number_of_pages_of_results_to_get) + ' pages of results...')
         except BaseException as e:
-            logger.error('Encountered Error getting number of pages of search results: ' + str(e))
+            logger.exception('Encountered Error getting number of pages of search results')
 
         for current_page in range(number_of_pages_of_results_to_get):
             number_of_tries_so_far = 0
@@ -632,10 +656,10 @@ class ChromeDriver:
                         if len(next_page_elements) > 0:
                             next_page_elements[0].click()
                     except:
-                        logger.error('Encountered Error trying to click next page element')
+                        logger.exception('Encountered Error trying to click next page element')
                 time.sleep(random.uniform(0.2, 0.6))
             except BaseException as e:
-                logger.error('Encountered Error scrolling to bottom for next page element: ' + str(e))
+                logger.exception('Encountered Error scrolling to bottom for next page element')
 
         try:
             list_of_sub_tables = [x for x in list_of_summary_dfs if len(x) > 0]
@@ -660,9 +684,13 @@ class ChromeDriver:
             #print("List of google reverse image search images before base64 split: " + ' '.join(map(str,combined_summary_df['img_src'].values.tolist())))
             if 'img_src_string' in combined_summary_df.columns.tolist():
                 list_of_google_reverse_image_search_images_as_base64 = [x.split('base64,')[-1] for x in combined_summary_df['img_src_string'].values.tolist()]
+                if len(list_of_google_reverse_image_search_images_as_base64) > self.MAX_SEARCH_RESULTS:
+                    logger.info(f"Truncating reverse search results [{len(list_of_google_reverse_image_search_images_as_base64)}] -> [{self.MAX_SEARCH_RESULTS}]")
+                    del list_of_google_reverse_image_search_images_as_base64[self.MAX_SEARCH_RESULTS :]
                 #print("List of google reverse image search images as base64: " + ' '.join(map(str,list_of_google_reverse_image_search_images_as_base64)))
                 if len(list_of_google_reverse_image_search_images_as_base64) > 0:
-                    list_of_google_reverse_image_search_image_indices_to_keep, list_of_image_base64_hashes_filtered, rare_on_internet__similarity_df, rare_on_internet__adjacency_df = self.filter_out_dissimilar_images_func(list_of_google_reverse_image_search_images_as_base64)
+                    list_of_google_reverse_image_search_image_indices_to_keep, list_of_image_base64_hashes_filtered, rare_on_internet__similarity_df, rare_on_internet__adjacency_df = \
+                        self.filter_out_dissimilar_images_func(list_of_google_reverse_image_search_images_as_base64)
                     combined_summary_df__filtered = combined_summary_df.iloc[list_of_google_reverse_image_search_image_indices_to_keep, :]
                     if combined_summary_df__filtered.shape[0] == len(list_of_google_reverse_image_search_image_indices_to_keep):
                         print('Keeping ' + str(len(list_of_google_reverse_image_search_image_indices_to_keep)) + ' of ' +
@@ -678,7 +706,7 @@ class ChromeDriver:
                 current_graph_json = ''
             status_result = 1
         except BaseException as e:
-            logger.error('Encountered Error combining sub-tables into combined table: ' + str(e))
+            logger.exception('Encountered Error combining sub-tables into combined table')
             combined_summary_df = pd.DataFrame()
             current_graph_json = ''
             #this would seem to indicate that there was an actual error in processing vs 0 results, so send a status result that causes us to try old code
@@ -697,7 +725,7 @@ class ChromeDriver:
                 min_number_of_exact_matches_in_page = 0
                 logger.info('No exact image matches found in page!')
         except BaseException as e:
-            logger.error('Encountered Error getting min number of exact matches in page: ' + str(e))
+            logger.exception('Encountered Error getting min number of exact matches in page')
             min_number_of_exact_matches_in_page = 0
         return status_result, combined_summary_df, min_number_of_exact_matches_in_page, current_graph_json
 
@@ -743,10 +771,10 @@ class ChromeDriver:
 
     def prepare_image_for_serving_func(self):
         sha3_256_hash_of_image_file = get_image_hash_from_image_file_path_func(self.resized_image_save_path)
-        image_format = self.resized_image_save_path.split('.')[-1]
+        image_format = self.resized_image_save_path.suffix[1:]
         destination_path = SERVED_FILES_PATH + sha3_256_hash_of_image_file[0:10] + '.' + image_format[0:3]
         shutil.copy(self.resized_image_save_path, destination_path)
-        logger.info('Copied file ' + self.resized_image_save_path + ' to path ' + destination_path)
+        logger.info(f'Copied file {str(self.resized_image_save_path)} to path {destination_path}')
         destination_url = 'http://' + self.get_ip_func() + '/' + sha3_256_hash_of_image_file[0:10] + '.' + image_format
         self.remove_old_served_image_files_func()
         return destination_path, destination_url
@@ -841,7 +869,7 @@ class ChromeDriver:
                 logger.info(final_filtered_list_of_strings_sorted_by_length)
                 print('list_of_strings_sorted_by_length__filtered_final', list_of_strings_sorted_by_length__filtered_final)
             except BaseException as e:
-                logger.error('Encountered Error putting fuzzy matches in dataframe: ' + str(e))
+                logger.exception('Encountered Error putting fuzzy matches in dataframe')
                 final_filtered_list_of_strings_sorted_by_length = list_of_strings_sorted_by_length__filtered_final
             image_elements_on_page = self.driver.find_elements(By.XPATH, "//img")
             if len(image_elements_on_page) > 0:
@@ -858,6 +886,11 @@ class ChromeDriver:
                                                        list_boolean_filter[idx]]
                 list_of_images_as_base64 = [self.get_content_and_generate_thumbnail_func(x) for idx, x in
                                             enumerate(list_of_image_src_strings) if list_boolean_filter[idx]]
+                if len(list_of_images_as_base64) > self.MAX_SEARCH_RESULTS:
+                    logger.info(f"Truncating image search results [{len(list_of_images_as_base64)}] -> [{self.MAX_SEARCH_RESULTS}]")
+                    del list_of_images_as_base64[self.MAX_SEARCH_RESULTS :]
+            current_graph_json = ''
+            list_of_images_as_base64__filtered = []
             if len(list_of_images_as_base64) > 0:
                 try:
                     list_of_image_indices_to_keep, alt_list_of_image_base64_hashes_filtered, alt_rare_on_internet__similarity_df, alt_rare_on_internet__adjacency_df = self.filter_out_dissimilar_images_func(list_of_images_as_base64)
@@ -884,11 +917,10 @@ class ChromeDriver:
                                                                                   alt_rare_on_internet__similarity_df,
                                                                                   alt_rare_on_internet__adjacency_df)
                 except BaseException as e:
-                    logger.error('Encountered problem filtering out dissimilar images from Google Lens data:' + str(e))
+                    logger.exception('Encountered problem filtering out dissimilar images from Google Lens data')
             else:
                 list_of_images_as_base64__filtered = list_of_images_as_base64
                 alt_list_of_image_base64_hashes_filtered = [get_sha256_hash_of_input_data_func(x) for x in list_of_images_as_base64]
-                current_graph_json = ''
 
             alternative_rare_on_internet_graph_json_compressed_b64 = compress_text_data_with_zstd_and_encode_as_base64_func(current_graph_json)
 
@@ -901,16 +933,17 @@ class ChromeDriver:
             dict_of_google_lens_results_as_json = json.dumps(dict_of_google_lens_results)
             return dict_of_google_lens_results_as_json
         except BaseException as e:
-            logger.error('Problem getting Google Lens data:' + str(e))
+            logger.exception('Problem getting Google Lens data')
             dict_of_google_lens_results_as_json = ''
             return dict_of_google_lens_results_as_json
 
 
     def search_google_image_search_for_image_func(self):
+        status_result = 0
         try:
             with time_limit(40, 'Search google image search for image.'):
                 try:
-                    resized_image_save_path = self.config.resized_images_top_save_path + self.img.file_name
+                    resized_image_save_path = self.config.resized_images_top_save_path / self.img.file_name
                     self.resized_image_save_path = resized_image_save_path
                     self.img.save_thumbnail(resized_image_save_path)
                     google_reverse_image_search_base_url = 'https://www.google.com/imghp?hl=en'
@@ -926,7 +959,7 @@ class ChromeDriver:
                                 current_button.click()
                                 logger.info('Had to click -No Thanks- button when asked to login to a Google account. Done successfully.')
                             except BaseException as e:
-                                logger.info('Could not click on the -No Thanks- button. Error message: ' + str(e))
+                                logger.exception('Could not click on the -No Thanks- button')
                     try:
                         buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'I agree')]")
                         if len(buttons) > 0:
@@ -938,7 +971,7 @@ class ChromeDriver:
                                     current_button.click()
                                     logger.info('Had to click -I Agree- button. Done successfully.')
                                 except BaseException as e:
-                                    logger.info('Could not click on the -I Agree- button. Error message: ' + str(e))
+                                    logger.exception('Could not click on the -I Agree- button')
                     except:
                         pass
                     try:
@@ -952,7 +985,7 @@ class ChromeDriver:
                                     current_button.click()
                                     logger.info('Had to click -Accept all- button. Done successfully.')
                                 except BaseException as e:
-                                    logger.info('Could not click on the -Accept all- button. Error message: ' + str(e))
+                                    logger.exception('Could not click on the -Accept all- button')
                     except:
                         pass
                     logger.info('Trying to select "Search by Image" button...')
@@ -980,10 +1013,10 @@ class ChromeDriver:
                                 current_button.click()
                                 logger.info('Clicked "upload an image" button!')
                                 time.sleep(random.uniform(0.2, 0.4))
-                                logger.info('Sending the following file path string to file upload selector control: \n' + resized_image_save_path + '\n')
-                                file_selector = self.driver.find_element_by_xpath("//input[@type='file']")
+                                logger.info(f'Sending the following file path string to file upload selector control:\n{str(resized_image_save_path)}\n')
+                                file_selector = self.driver.find_element(By.XPATH, "//input[@type='file']")
                                 self.driver.execute_script("arguments[0].style.display = 'block';", file_selector)
-                                file_selector.send_keys(resized_image_save_path)
+                                file_selector.send_keys(str(resized_image_save_path))
                                 logger.info('Sent file path to file selector control!')
                             except:
                                 pass
@@ -1006,7 +1039,7 @@ class ChromeDriver:
                             logger.info('Error message: ' + str(e))
                             pass
                 except BaseException as e:
-                    logger.error('Problem using Selenium driver, now trying with local HTTP server. Error encountered: ' + str(e))
+                    logger.exception('Problem using Selenium driver, now trying with local HTTP server')
                     try:
                         destination_path, destination_url = self.prepare_image_for_serving_func()
                         logger.info('Local http link for image: ' + destination_url)
@@ -1025,8 +1058,8 @@ class ChromeDriver:
                             logger.error('Resized image is not a valid image!')
                             raise ValueError('Resized image for reverse image search is invalid!')
                     except BaseException as e:
-                        logger.error('Problem using local HTTP hosting, now trying with Imgur upload! Error encountered: ' + str(e))
-                        uploaded_image = im.upload_image(resized_image_save_path,
+                        logger.exception('Problem using local HTTP hosting, now trying with Imgur upload!')
+                        uploaded_image = im.upload_image(str(resized_image_save_path),
                                                         title="PastelNetwork: " + str(datetime.now()))
                         time.sleep(random.uniform(2.5, 5.5))
                         logger.info('Imgur link: ' + uploaded_image.link)
@@ -1034,14 +1067,15 @@ class ChromeDriver:
                         self.driver.get(google_reverse_image_search_base_url)
                         status_result = 1
         except BaseException as e:
-            logger.error('Encountered Error with "Rare on Internet" check: ' + str(e))
+            logger.exception('Encountered Error with "Rare on Internet" check')
             status_result = 0
         return status_result
 
     def search_google_lens_for_image_func(self):
+        status_result = 0
         with time_limit(40, 'Search google lens for image.'):
             try:
-                resized_image_save_path = self.config.resized_images_top_save_path + self.img.file_name
+                resized_image_save_path = self.config.resized_images_top_save_path / self.img.file_name
                 self.resized_image_save_path = resized_image_save_path
                 self.img.save_thumbnail(resized_image_save_path)
                 google_lens_base_url = 'https://lens.google.com/search?p='
@@ -1095,7 +1129,7 @@ class ChromeDriver:
                 
                 
                 logger.info('Now trying to click the Upload button...')
-                list_of_buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'file_upload')]")
+                list_of_buttons = self.driver.find_elements(By.XPATH, "//span[contains(text(), 'Upload')]")
                 if len(list_of_buttons) > 0:
                     for current_button in list_of_buttons:
                         try:
@@ -1109,7 +1143,7 @@ class ChromeDriver:
                             pass
                         
                 logger.info('Now trying to click the Computer button...')
-                list_of_buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'laptop_chromebook')]")
+                list_of_buttons = self.driver.find_elements(By.XPATH, "//span[contains(text(), 'Computer')]")
                 if len(list_of_buttons) > 0:
                     for current_button in list_of_buttons:
                         try:
@@ -1144,17 +1178,19 @@ class ChromeDriver:
                 #             time.sleep(random.uniform(0.1, 0.2))
                 #         except:
                 #             pass
-                time.sleep(random.uniform(0.1, 0.2))
-                choose_file_button_element = self.driver.find_element_by_xpath("//input[@type='file']")
+                time.sleep(random.uniform(0.5, 1.0))
+                choose_file_button_element = self.driver.find_element(By.XPATH, "//input[@type='file']")
+                if choose_file_button_element is not None:
+                    logger.info('Found file input element')
                 self.driver.execute_script("arguments[0].style.display = 'block';", choose_file_button_element)
-                choose_file_button_element.send_keys(resized_image_save_path)
+                choose_file_button_element.send_keys(str(resized_image_save_path))
                 status_result = 1
             except BaseException as e:
-                logger.error('Problem getting Google lens data:' + str(e))
-                status_result = 0
+                logger.exception('Problem getting Google lens data')
         return status_result, resized_image_save_path
 
     def get_list_of_similar_images_func(self):
+        status_result = 0
         list_of_urls_of_images_in_page = list()
         list_of_urls_of_visually_similar_images = list()
         try:
@@ -1173,8 +1209,7 @@ class ChromeDriver:
                 list_of_urls_of_visually_similar_images = list(set(list_of_urls_of_visually_similar_images))
                 status_result = 1
         except BaseException as e:
-            logger.error('Encountered Error: ' + str(e))
-            status_result = 0
+            logger.exception('Encountered Error')
             list_of_urls_of_images_in_page__clean = list()
         return status_result, list_of_urls_of_images_in_page__clean, list_of_urls_of_visually_similar_images
 
@@ -1208,14 +1243,5 @@ class ChromeDriver:
             self.driver.back()
 
         except BaseException as e:
-            logger.error('Encountered Error getting number of pages of search results: ' + str(e))
+            logger.exception('Encountered Error getting number of pages of search results')
         return number_of_pages_of_results
-    
-    
-    
-    
-    
-    
-    
-    
-    
