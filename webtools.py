@@ -842,9 +842,6 @@ class ChromeDriver:
                         list_of_href_strings__filtered = []
                         alt_list_of_image_base64_hashes_filtered = []
 
-                    logger.info('list_of_images_as_base64__filtered[0]: ')
-                    logger.info(list_of_images_as_base64__filtered[0])
-
                     current_graph_json = generate_alt_rare_on_internet_graph_func(list_of_images_as_base64__filtered, 
                                                                                   list_of_img_src_strings__filtered,
                                                                                   list_of_alt_strings__filtered,
