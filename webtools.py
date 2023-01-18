@@ -19,7 +19,6 @@ from datetime import datetime
 import datefinder
 import requests
 from html.parser import HTMLParser
-from html import unescape
 import zstandard as zstd
 from contextlib import contextmanager
 import _thread
@@ -34,10 +33,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException
 import pandas as pd
 import pyimgur
-from fuzzywuzzy import process
 import torch
 from torch import nn
-from torch.utils.data import Dataset
 import torchvision
 import torchvision.transforms
 import faiss
@@ -168,18 +165,21 @@ def generate_rare_on_internet_graph_func(combined_summary_df, rare_on_internet__
     return current_graph_json
 
 
-def generate_alt_rare_on_internet_graph_func(list_of_images_as_base64__filtered, list_of_image_src_strings__filtered, list_of_image_alt_strings__filtered, alt_list_of_image_base64_hashes_filtered, alt_rare_on_internet__similarity_df, alt_rare_on_internet__adjacency_df):
+def generate_alt_rare_on_internet_graph_func(list_of_images_as_base64__filtered, list_of_image_src_strings__filtered, list_of_image_alt_strings__filtered, list_of_href_strings__filtered, alt_list_of_image_base64_hashes_filtered, alt_rare_on_internet__similarity_df, alt_rare_on_internet__adjacency_df):
     links_list = []
     nodes_list = []
     list_of_images_as_base64 = list_of_images_as_base64__filtered
     list_of_image_hashes = alt_list_of_image_base64_hashes_filtered
     list_of_img_src_strings = list_of_image_src_strings__filtered
     list_of_img_alt_strings = list_of_image_alt_strings__filtered
+    list_of_href_strings = list_of_href_strings__filtered
     list_of_image_labels =  alt_rare_on_internet__adjacency_df.index.tolist()
     image_label_to_image_base64_string = dict(zip(list_of_image_labels, list_of_images_as_base64))
     image_label_to_image_hash_dict = dict(zip(list_of_image_labels, list_of_image_hashes))
     image_label_to_img_src_dict = dict(zip(list_of_image_labels, list_of_img_src_strings))
     image_label_to_img_alt_dict = dict(zip(list_of_image_labels, list_of_img_alt_strings))
+    image_label_to_img_original_link_dict = dict(zip(list_of_image_labels, list_of_href_strings))
+
     cntr = 0
     for ii, label1 in enumerate(list_of_image_labels):
         try:
@@ -189,6 +189,7 @@ def generate_alt_rare_on_internet_graph_func(list_of_images_as_base64__filtered,
                                             sha3_256_hash_of_image_base64_string=image_label_to_image_hash_dict[label1],
                                             img_src=image_label_to_img_src_dict[label1],
                                             img_alt=image_label_to_img_alt_dict[label1],
+                                            original_url=image_label_to_img_original_link_dict[label1]
                                             )]
         except BaseException as e:
             logger.exception('Encountered error adding node to alternative rare on internet graph structure')
@@ -213,7 +214,7 @@ def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
 
 
 class ChromeDriver:
-    WEBTOOLS_VERSION = "1.0"
+    WEBTOOLS_VERSION = "1.1"
     MAX_SEARCH_RESULTS = 50
 
     def __init__(self, config: Config, img: DDImage):
@@ -349,11 +350,11 @@ class ChromeDriver:
         train_scores, I = index.search(numpy_feature_of_query.astype('float32'), 10)
         score_norms = train_scores.mean(axis=1) * 2
         cos_scores = cos_scores - score_norms
-        min_normalized_cos_similarity_threshold__lowest_permissible = -0.18
-        target_pct_of_results_to_keep = 0.35
+        min_normalized_cos_similarity_threshold__lowest_permissible = -0.1
+        target_pct_of_results_to_keep = 0.25
         print('Target percentage of results to keep: ', target_pct_of_results_to_keep)
         if img_count >= 3:
-            min_normalized_cos_similarity_threshold = 0.0
+            min_normalized_cos_similarity_threshold = 0.05
             number_of_images_above_similarity_threshold = np.sum([(x > min_normalized_cos_similarity_threshold).astype(int) for idx, x in enumerate(cos_scores)])
             pct_of_images_above_similarity_threshold = number_of_images_above_similarity_threshold / len(cos_scores)
             while ( (pct_of_images_above_similarity_threshold < target_pct_of_results_to_keep) and (min_normalized_cos_similarity_threshold >= min_normalized_cos_similarity_threshold__lowest_permissible) ):
@@ -797,122 +798,57 @@ class ChromeDriver:
             logger.info('Now attempting to retrieve Google Lens results for image...')
             status_result__google_lens, resized_image_save_path = self.search_google_lens_for_image_func()
             logger.info('Now waiting for elements to be visible...')
-            WebDriverWait(self.driver, 15).until(lambda wd: wd.find_element(By.XPATH, "//div[contains(@aria-live,'polite')]"))
+            WebDriverWait(self.driver, 15).until(lambda wd: wd.find_element(By.XPATH, "//*[contains(text(), 'Visual matches')]"))
             logger.info('Last wait')
             time.sleep(random.uniform(2, 4))
-            google_lens_data_container_element = self.driver.find_elements(By.XPATH, "//div[contains(@aria-live,'polite')]")
-            list_of_text_strings = []
-            list_of_image_src_strings = []
-            list_of_image_alt_strings = []
-            list_of_images_as_base64 = []
-            if len(google_lens_data_container_element) > 0:
-                list_of_inner_html = [x.get_attribute('innerHTML') for x in google_lens_data_container_element]
-                # print("Inner HTML", list_of_inner_html)
-                parser = MyHTMLParser()
-                if len(list_of_inner_html) > 0:
-                    parser.feed(list_of_inner_html[0])
-                    list_of_text_strings = parser.data
-                    # print("List of text strings: ",list_of_text_strings)
-                    list_of_text_strings = [unescape(x) for x in list_of_text_strings]
-                else:
-                    print("length of inner html less than 0")
-            else:
-                print("google lens data container element length zero")
-            list_of_text_strings_sorted_by_length = sorted(list_of_text_strings, key=len)
-            list_of_text_strings_sorted_by_length.reverse()
-            list_of_text_strings_sorted_by_length__filtered1 = [x.replace('&amp;', '&') for x in
-                                                                list_of_text_strings_sorted_by_length if 15 < len(x) < 100]
-            list_of_text_strings_sorted_by_length__filtered2 = [x for x in list_of_text_strings_sorted_by_length__filtered1
-                                                                if not ('$' in x and len(x) < 30)]
-            list_of_text_strings_sorted_by_length__filtered3 = [x for x in list_of_text_strings_sorted_by_length__filtered2
-                                                                if not ('.com' in x and len(x) < 30)]
-            list_of_text_strings_sorted_by_length__filtered4 = [x for x in list_of_text_strings_sorted_by_length__filtered3
-                                                                if not ('find what you were looking for?' in x)]
-            list_of_text_strings_sorted_by_length__filtered5 = [x for x in list_of_text_strings_sorted_by_length__filtered4
-                                                                if not ('Did you find these results useful?' in x)]
-            list_of_text_strings_sorted_by_length__filtered6 = [x for x in list_of_text_strings_sorted_by_length__filtered5
-                                                                if not ('Pages that include matching images' in x)]
-            list_of_text_strings_sorted_by_length__filtered7 = [x for x in list_of_text_strings_sorted_by_length__filtered6
-                                                                if not (
-                        'Check website for latest pricing and availability' in x)]
-            list_of_text_strings_sorted_by_length__filtered8 = [x for x in list_of_text_strings_sorted_by_length__filtered7
-                                                                if not ('Lens Results' in x)]
-            list_of_text_strings_sorted_by_length__filtered9 = [x for x in list_of_text_strings_sorted_by_length__filtered8
-                                                                if not ('Related Results' in x)]
-
-            list_of_strings_sorted_by_length__filtered_final = list_of_text_strings_sorted_by_length__filtered9
-            logger.info('Text strings in alternative rare on internet results BEFORE fuzzy matching:\n')
-            logger.info(list_of_strings_sorted_by_length__filtered_final)
-            list_of_all_df_rows = []
-            for idx1, current_string in enumerate(list_of_strings_sorted_by_length__filtered_final):
-                current_string_match_results = process.extract(current_string,
-                                                               [x for x in list_of_strings_sorted_by_length__filtered_final
-                                                                if x != current_string], limit=30)
-                current_list_of_df_rows = []
-                for idx2, current_match_result in enumerate(current_string_match_results):
-                    current_df_row = [current_string, current_match_result[0], current_match_result[1]]
-                    current_list_of_df_rows.append(current_df_row)
-                list_of_all_df_rows = list_of_all_df_rows + current_list_of_df_rows
-            try:
-                fuzzy_match_df = pd.DataFrame(list_of_all_df_rows)
-                fuzzy_match_df.columns = ['source_string', 'match_string', 'similarity_score']
-                similarity_score_threshold1 = 55.0
-                similarity_score_threshold2 = 88.0
-                fuzzy_match_df__filtered = fuzzy_match_df[fuzzy_match_df['similarity_score'] > similarity_score_threshold1]
-                fuzzy_match_df__filtered = fuzzy_match_df__filtered[fuzzy_match_df__filtered['similarity_score'] < similarity_score_threshold2]
-                print('fuzzy_match_df__filtered', fuzzy_match_df__filtered)
-                combined_filtered_strings = fuzzy_match_df__filtered['match_string'].values.tolist()
-                final_filtered_list_of_strings = list(set(combined_filtered_strings))
-                final_filtered_list_of_strings_sorted_by_length = sorted(final_filtered_list_of_strings, key=len)
-                final_filtered_list_of_strings_sorted_by_length.reverse()
-                logger.info('Text strings in alternative rare on internet results AFTER fuzzy matching:\n')
-                logger.info(final_filtered_list_of_strings_sorted_by_length)
-                print('list_of_strings_sorted_by_length__filtered_final', list_of_strings_sorted_by_length__filtered_final)
-            except BaseException as e:
-                logger.exception('Encountered Error putting fuzzy matches in dataframe')
-                final_filtered_list_of_strings_sorted_by_length = list_of_strings_sorted_by_length__filtered_final
-            image_elements_on_page = self.driver.find_elements(By.XPATH, "//img")
-            if len(image_elements_on_page) > 0:
-                list_of_image_src_strings = [x.get_attribute("src").replace('blob:http', 'http') for x in
-                                             image_elements_on_page]
-                list_of_image_alt_strings = [x.get_attribute("alt") for x in image_elements_on_page]
-                # logger.info('List of image src strings:\n')
-                # logger.info(list_of_image_src_strings)
-                list_boolean_filter = [('images/icons/material' not in x) and ('com/images/branding' not in x) and (len(x) > 100) for x
-                                       in list_of_image_src_strings]
-                list_of_image_src_strings__filtered = [x for idx, x in enumerate(list_of_image_src_strings) if
-                                                       list_boolean_filter[idx]]
-                list_of_image_alt_strings__filtered = [x for idx, x in enumerate(list_of_image_alt_strings) if
-                                                       list_boolean_filter[idx]]
-                list_of_images_as_base64 = [self.get_content_and_generate_thumbnail_func(x) for idx, x in
-                                            enumerate(list_of_image_src_strings) if list_boolean_filter[idx]]
-                if len(list_of_images_as_base64) > self.MAX_SEARCH_RESULTS:
-                    logger.info(f"Truncating image search results [{len(list_of_images_as_base64)}] -> [{self.MAX_SEARCH_RESULTS}]")
-                    del list_of_images_as_base64[self.MAX_SEARCH_RESULTS :]
+            logger.info('Now parsing page with BeautifulSoup...')
+            soup = BeautifulSoup(self.driver.page_source, "lxml")    
+            logger.info('Done parsing page!')
+            a_elements = [x for x in soup.find_all('a') if x.has_attr('aria-label') ]
+            a_elements_filtered = [x for x in a_elements if ' data-thumbnail-url=' in str(x) and ' data-item-title="' in str(x)]
+            a_elements_filtered_strings = [str(x) for x in a_elements_filtered]
+            list_of_alt_strings = [(x.split(' data-item-title="'))[1].split(' data-thumbnail-url=')[0] for x in a_elements_filtered_strings]
+            list_of_img_src_strings = [(x.split(' data-thumbnail-url='))[1].split(' jsaction="')[0] for x in a_elements_filtered_strings]
+            list_of_img_src_strings = [x.replace('"','') for x in list_of_img_src_strings] #get rid of quote marks before and after the url
+            list_of_href_strings = [(x.split('" href="'))[1].split('" role="')[0] for x in a_elements_filtered_strings]
+            logger.info('Now getting images and storing as base64 strings...')
+            logger.info('Done!')
+            if len(list_of_img_src_strings) > self.MAX_SEARCH_RESULTS:
+                logger.info(f"Truncating image search results [{len(list_of_img_src_strings)}] -> [{self.MAX_SEARCH_RESULTS}]")
+                list_of_alt_strings = list_of_alt_strings[:self.MAX_SEARCH_RESULTS]                    
+                list_of_img_src_strings = list_of_img_src_strings[:self.MAX_SEARCH_RESULTS]                    
+                list_of_href_strings = list_of_href_strings[:self.MAX_SEARCH_RESULTS]
+            list_of_images_as_base64 = [self.get_content_and_generate_thumbnail_func(x) for x in list_of_img_src_strings]
             current_graph_json = ''
-            list_of_images_as_base64__filtered = []
-            if len(list_of_images_as_base64) > 0:
+            if len(list_of_img_src_strings) > 0:
                 try:
                     list_of_image_indices_to_keep, alt_list_of_image_base64_hashes_filtered, alt_rare_on_internet__similarity_df, alt_rare_on_internet__adjacency_df = self.filter_out_dissimilar_images_func(list_of_images_as_base64)
-                    print('Keeping ' + str(len(list_of_image_indices_to_keep)) + ' of ' +
-                            str(len(list_of_images_as_base64)) + 
-                            ' google lens images that are above the similarity score threshold.')
-                    if(len(list_of_image_indices_to_keep)) > 0:
-                        list_of_images_as_base64__filtered = list(np.array(list_of_images_as_base64)[list_of_image_indices_to_keep][1:]) #the [1:] skips over the "visually analyzed image", which isn't a real search result
-                        list_of_image_src_strings__filtered = list(np.array(list_of_image_src_strings__filtered)[list_of_image_indices_to_keep][1:])
-                        list_of_image_alt_strings__filtered = list(np.array(list_of_image_alt_strings__filtered)[list_of_image_indices_to_keep][1:])
-                        alt_list_of_image_base64_hashes_filtered = alt_list_of_image_base64_hashes_filtered[1:]
+                    logger.info('Keeping ' + str(len(list_of_image_indices_to_keep)) + ' of ' + str(len(list_of_images_as_base64)) + ' google lens images that are above the similarity score threshold.')
+                    logger.info('List of indices to keep:')
+                    logger.info(str(list_of_image_indices_to_keep))
+                    if len(list_of_image_indices_to_keep) > 0:
+                        list_of_img_src_strings__filtered = list(np.array(list_of_img_src_strings)[list_of_image_indices_to_keep])
+                        list_of_images_as_base64__filtered = [self.get_content_and_generate_thumbnail_func(x) for x in list_of_img_src_strings__filtered]
+                        list_of_alt_strings__filtered = list(np.array(list_of_alt_strings)[list_of_image_indices_to_keep])
+                        list_of_href_strings__filtered = list(np.array(list_of_href_strings)[list_of_image_indices_to_keep])
+                        alt_list_of_image_base64_hashes_filtered = alt_list_of_image_base64_hashes_filtered
                         alt_rare_on_internet__similarity_df = alt_rare_on_internet__similarity_df.loc[alt_list_of_image_base64_hashes_filtered, alt_list_of_image_base64_hashes_filtered]
                         alt_rare_on_internet__adjacency_df = alt_rare_on_internet__adjacency_df.loc[alt_list_of_image_base64_hashes_filtered, alt_list_of_image_base64_hashes_filtered]
                     else:
-                        print('Now images kept in google lens results!')
+                        logger.info('Zero images kept in google lens results! Either image was not found, or there was some kind of problem!')
                         list_of_images_as_base64__filtered = []
-                        list_of_image_src_strings__filtered = []
-                        list_of_image_alt_strings__filtered = []
+                        list_of_img_src_strings__filtered = []
+                        list_of_alt_strings__filtered = []
+                        list_of_href_strings__filtered = []
                         alt_list_of_image_base64_hashes_filtered = []
+
+                    logger.info('list_of_images_as_base64__filtered[0]: ')
+                    logger.info(list_of_images_as_base64__filtered[0])
+
                     current_graph_json = generate_alt_rare_on_internet_graph_func(list_of_images_as_base64__filtered, 
-                                                                                  list_of_image_src_strings__filtered,
-                                                                                  list_of_image_alt_strings__filtered, 
+                                                                                  list_of_img_src_strings__filtered,
+                                                                                  list_of_alt_strings__filtered,
+                                                                                  list_of_href_strings__filtered,
                                                                                   alt_list_of_image_base64_hashes_filtered,
                                                                                   alt_rare_on_internet__similarity_df,
                                                                                   alt_rare_on_internet__adjacency_df)
@@ -924,11 +860,11 @@ class ChromeDriver:
 
             alternative_rare_on_internet_graph_json_compressed_b64 = compress_text_data_with_zstd_and_encode_as_base64_func(current_graph_json)
 
-            dict_of_google_lens_results = {'list_of_text_strings': final_filtered_list_of_strings_sorted_by_length,
-                                           'list_of_image_src_strings': list_of_image_src_strings__filtered,
-                                           'list_of_image_alt_strings': list_of_image_alt_strings__filtered,
+            dict_of_google_lens_results = {'list_of_image_src_strings': list_of_img_src_strings__filtered,
+                                           'list_of_image_alt_strings': list_of_alt_strings__filtered,
                                            'list_of_images_as_base64': list_of_images_as_base64__filtered,
                                            'list_of_sha3_256_hashes_of_images_as_base64': alt_list_of_image_base64_hashes_filtered,
+                                           'list_of_href_strings': list_of_href_strings__filtered,
                                            'alternative_rare_on_internet_graph_json_compressed_b64': alternative_rare_on_internet_graph_json_compressed_b64}
             dict_of_google_lens_results_as_json = json.dumps(dict_of_google_lens_results)
             return dict_of_google_lens_results_as_json
