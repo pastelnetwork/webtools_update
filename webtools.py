@@ -42,7 +42,7 @@ import h5py
 import numpy as np
 from bs4 import BeautifulSoup
 
-from lib.utils import DDImage, MyTimer
+from lib.utils import DDImage, ScopeTimer
 from lib.logger import logger
 from lib.config import Config
 from lib import models
@@ -214,7 +214,7 @@ def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
 
 
 class ChromeDriver:
-    WEBTOOLS_VERSION = "1.1"
+    WEBTOOLS_VERSION = "1.2"
     MAX_SEARCH_RESULTS = 50
 
     def __init__(self, config: Config, img: DDImage):
@@ -306,9 +306,7 @@ class ChromeDriver:
         logger.info(f"normalizing descriptors q {all_desc_q.shape}")
         faiss.normalize_L2(all_desc_q)
         logger.info("after q normalization")
-        logger.info(f"RAM used {psutil.virtual_memory()[3]}")
         all_desc_q = all_desc_q.transpose()
-        logger.info(f"RAM used {psutil.virtual_memory()[3]}")
         print("The shape of feature is q", all_desc_q.shape)
         print("all_desc_q", all_desc_q)
         all_desc_r = []
@@ -316,13 +314,11 @@ class ChromeDriver:
         logger.info(f"pre-processing {img_count} images")
         mem_size = psutil.virtual_memory()[3]
         for r_str in range(img_count):
-            logger.info(f"img {r_str + 1}/{img_count}")
             features = model.module.base(preprocess_image(base64_to_preimage(list_of_images_as_base64[r_str])))
             list_of_images_as_base64[r_str] = None
             features = features.view(features.size(0), -1)
             mem_size_old = mem_size
             mem_size = psutil.virtual_memory()[3]
-            logger.info(f"RAM used {mem_size}, delta={mem_size - mem_size_old}")
             all_desc_r.append(features)
         logger.info(f"RAM used {psutil.virtual_memory()[3]}")
         all_desc_r = torch.vstack(tuple(all_desc_r)).cpu().detach().numpy()
@@ -621,7 +617,7 @@ class ChromeDriver:
             if not old_code:
                 while (not extraction_successful) and (number_of_tries_so_far < number_of_times_to_try_new_code_before_reverting_to_old_code):
                     number_of_tries_so_far = number_of_tries_so_far + 1
-                    with MyTimer():
+                    with ScopeTimer():
                         extraction_successful, summary_df = self.try_to_get_table_from_page()
                         # if len(summary_df) == 0:
                         #     print('Rare on the internet table is empty... trying again using alternative approach:')
@@ -636,7 +632,7 @@ class ChromeDriver:
             else:
                 while (not extraction_successful) and (number_of_tries_so_far < number_of_times_to_try_new_code_before_reverting_to_old_code):
                     number_of_tries_so_far = number_of_tries_so_far + 1
-                    with MyTimer():
+                    with ScopeTimer():
                         extraction_successful, summary_df = self.try_to_get_table_from_page_old()
             print('Current Rare on the Internet summary_df:', summary_df)                                                                                
             list_of_summary_dfs = list_of_summary_dfs + [summary_df]
