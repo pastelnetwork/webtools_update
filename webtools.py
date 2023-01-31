@@ -15,14 +15,13 @@ import base64
 import json
 from pathlib import Path
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import datefinder
 import requests
 from html.parser import HTMLParser
 import zstandard as zstd
 from contextlib import contextmanager
 import _thread
-from itertools import groupby
 
 import chromedriver_autoinstaller
 from PIL import Image
@@ -84,7 +83,7 @@ class MyHTMLParser(HTMLParser):
 
 
 def remove_dupes_from_list_but_preserve_order_func(list_of_items):
-    deduplicated_list = [key for key, _ in groupby(list_of_items)]
+    deduplicated_list = list(dict.fromkeys(list_of_items).keys())
     return deduplicated_list
 
 
@@ -393,7 +392,6 @@ class ChromeDriver:
                 WebDriverWait(self.driver, 10).until(lambda wd: len([el for el in wd.find_element(By.ID,"search").find_elements(By.XPATH,'.//img') if el.is_displayed()])>3)
             except Exception as e: 
                 logger.error('Error encountered trying to find the "search" element on the page using the ID field...' + str(e))
-                logger.exception('Error: ' + str(e))
             print('Now parsing page with BeautifulSoup...')
             soup = BeautifulSoup(self.driver.page_source, "lxml")    
             print('Done parsing page!')
@@ -414,7 +412,6 @@ class ChromeDriver:
             print(f'list_of_resolution_strings: {type(list_of_resolution_strings)}')
         except BaseException as e:
             logger.exception('Encountered Error on the first pass of getting Rare on the Internet data using normal method, now trying again with other approach!')
-            logger.exception('Error: ' + str(e))
             page_source_text = self.driver.page_source
             problem_files_path = self.config.support_files_path / 'rare_on_the_internet_problem_pages'
             problem_files_path.mkdir(parents=True, exist_ok=True)
@@ -430,17 +427,14 @@ class ChromeDriver:
             list_of_date_strings_fixed = []
             for indx, current_date_list in enumerate(list_of_date_strings):
                 for current_date in current_date_list:
-                    if current_date.year < 2000:
-                        current_date_list.remove(current_date)
-                    if current_date > datetime.now():
+                    if current_date > datetime.now() - timedelta(days=2):
                         current_date_list.remove(current_date)
                 if len(current_date_list) > 0:                       
                     list_of_date_strings_fixed.append(min(current_date_list).isoformat().split('T0')[0].replace(' ','_').replace(':','_'))
                 else:
                     list_of_date_strings_fixed.append('')
         except BaseException as e:
-            logger.exception('Error encountered parsing dates in the rare on the internet results-- trying again a different way...')
-            logger.exception('Error: ' + str(e))
+            logger.exception('Error encountered parsing dates in the rare on the internet results...')
             page_source_text = self.driver.page_source
             problem_files_path = self.config.support_files_path / 'rare_on_the_internet_problem_pages'
             problem_files_path.mkdir(parents=True, exist_ok=True)
@@ -449,24 +443,6 @@ class ChromeDriver:
             print('\nSaving problem page to disk for analysis: ' + problem_page_output_path)
             with open(problem_page_output_path, 'w') as f:
                 f.write(page_source_text)
-            list_of_date_strings_fixed = []
-            for current_potential_date_string in sokoban_element_more_strings:
-                current_date_string = ''
-                current_date_string_fixed = ''
-                try:
-                    current_date_string = list(datefinder.find_dates(current_potential_date_string))
-                except:
-                    print('Could not parse date from string: ', current_potential_date_string)
-                if len(current_date_string) > 0:
-                    try:
-                        if current_date_string[0].isoformat() <= datetime.now():
-                            current_date_string_fixed = current_date_string[0].isoformat().split('T0')[0].replace(' ','_').replace(':','_')
-                        else:
-                            print('Date was from the future, so obviously invalid! Ignoring...')
-                            current_date_string_fixed = ''
-                    except:
-                        print('Could not parse date from string: ', current_date_string)
-                list_of_date_strings_fixed.append(current_date_string_fixed)
         try:
             print('list_of_date_strings_fixed: ', list_of_date_strings_fixed)
             list_of_original_urls = [x.split(' href="')[1].split('" ping="')[0].split('">')[0].strip() for x in sokoban_element_more_strings]
@@ -503,7 +479,6 @@ class ChromeDriver:
             status = 1
         except BaseException as e:
             logger.exception('Encountered Error getting rare on the internet using normal method, trying again with other approach!')
-            logger.exception('Error: ' + str(e))
             status, current_page_results_df = self.try_to_get_table_from_page_old()
             return status, current_page_results_df    
         return status, current_page_results_df
@@ -520,7 +495,6 @@ class ChromeDriver:
             search_element = self.driver.find_element(By.ID, 'search')
         except BaseException as e:
             logger.exception('Error encountered trying to select the "search" element on the page using the ID field...')
-            logger.exception('Error: ' + str(e))
             page_source_text = self.driver.page_source
             problem_files_path = self.config.support_files_path / 'rare_on_the_internet_problem_pages'
             problem_files_path.mkdir(parents=True, exist_ok=True)
@@ -629,7 +603,6 @@ class ChromeDriver:
                 logger.info('Attempting to get ' + str(number_of_pages_of_results_to_get) + ' pages of results...')
         except BaseException as e:
             logger.exception('Encountered Error getting number of pages of search results')
-            logger.exception('Error: ' + str(e))
 
         for current_page in range(number_of_pages_of_results_to_get):
             number_of_tries_so_far = 0
@@ -642,16 +615,6 @@ class ChromeDriver:
                     number_of_tries_so_far = number_of_tries_so_far + 1
                     with ScopeTimer():
                         extraction_successful, summary_df = self.try_to_get_table_from_page()
-                        # if len(summary_df) == 0:
-                        #     print('Rare on the internet table is empty... trying again using alternative approach:')
-                        #     page_source_text = self.driver.page_source
-                        #     problem_files_path = pathlib.Path(self.config.support_files_path + 'rare_on_the_internet_problem_pages/')
-                        #     problem_files_path.mkdir(parents=True, exist_ok=True)
-                        #     problem_page_output_path = str(problem_files_path) + '/main_code__problem_page__' + datetime.now().strftime("%Y_%m_%d__%H_%M_%S") + '.html'
-                        #     print('\nSaving problem page to disk for analysis: ' + problem_page_output_path)
-                        #     with open(problem_page_output_path, 'w') as f:
-                        #         f.write(page_source_text)
-                        #     extraction_successful, summary_df = self.try_to_get_table_from_page_old()
             else:
                 while (not extraction_successful) and (number_of_tries_so_far < number_of_times_to_try_new_code_before_reverting_to_old_code):
                     number_of_tries_so_far = number_of_tries_so_far + 1
@@ -680,15 +643,12 @@ class ChromeDriver:
                 time.sleep(random.uniform(0.2, 0.6))
             except BaseException as e:
                 logger.exception('Encountered Error scrolling to bottom for next page element')
-                logger.exception('Error: ' + str(e))
         try:
             list_of_sub_tables = [x for x in list_of_summary_dfs if len(x) > 0]
             if len(list_of_sub_tables) > 0:
                 combined_summary_df = pd.concat(list_of_sub_tables, axis=0)
                 #print("combined_summary_df length before drop dupes: " + str(len(combined_summary_df)))
-                #combined_summary_df = combined_summary_df.drop_duplicates(subset=['result_title', 'title_y_coordinate'])
                 combined_summary_df = combined_summary_df.drop_duplicates(subset=['title'])
-                #print("combined_summary_df length after drop dupe titles: " + str(len(combined_summary_df)))
                 if 'img_src_string' in combined_summary_df.columns.tolist():
                     combined_summary_df = combined_summary_df.dropna(subset=['img_src_string'])
                     combined_summary_df = combined_summary_df[
@@ -776,7 +736,6 @@ class ChromeDriver:
                     os.remove(current_file_path)
         except:
             logger.error('Error removing old thumbnail images...')
-            logger.exception('Error: ' + str(e))
 
     def remove_old_rare_on_internet_diagnostic_files_func(self, problem_files_path):
         limit_days = 3
@@ -791,7 +750,6 @@ class ChromeDriver:
                     os.remove(current_file_path)
         except:
             logger.error('Error removing old Rare on the Internet diagnostic html file...')
-            logger.exception('Error: ' + str(e))
 
     def prepare_image_for_serving_func(self):
         sha3_256_hash_of_image_file = get_image_hash_from_image_file_path_func(self.resized_image_save_path)
@@ -891,7 +849,6 @@ class ChromeDriver:
             return dict_of_google_lens_results_as_json
         except BaseException as e:
             logger.exception('Problem getting Google Lens data')
-            logger.exception('Error: ' + str(e))
             dict_of_google_lens_results_as_json = ''
             return dict_of_google_lens_results_as_json
 
