@@ -356,7 +356,7 @@ class ChromeDriver:
         min_target_pct_of_results_to_keep = 0.25
         print('Minimum target percentage of results to keep: ', min_target_pct_of_results_to_keep)
         if img_count >= 3:
-            min_normalized_cos_similarity_threshold = 0.50
+            min_normalized_cos_similarity_threshold = 0.05
             number_of_images_above_similarity_threshold = np.sum([(x > min_normalized_cos_similarity_threshold).astype(int) for idx, x in enumerate(cos_scores)])
             pct_of_images_above_similarity_threshold = number_of_images_above_similarity_threshold / len(cos_scores)
             while ( (pct_of_images_above_similarity_threshold < min_target_pct_of_results_to_keep) and (min_normalized_cos_similarity_threshold >= min_normalized_cos_similarity_threshold__lowest_permissible) ):
