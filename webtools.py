@@ -15,7 +15,7 @@ import base64
 import json
 from pathlib import Path
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import datefinder
 import requests
 from html.parser import HTMLParser
@@ -23,7 +23,6 @@ import zstandard as zstd
 from contextlib import contextmanager
 import _thread
 
-import chromedriver_autoinstaller
 from PIL import Image
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -80,6 +79,11 @@ class MyHTMLParser(HTMLParser):
         data = data.strip()
         if data:
             self.data.append(data)
+
+
+def remove_dupes_from_list_but_preserve_order_func(list_of_items):
+    deduplicated_list = list(dict.fromkeys(list_of_items).keys())
+    return deduplicated_list
 
 
 def get_sha256_hash_of_input_data_func(input_data_or_string):
@@ -161,7 +165,7 @@ def generate_rare_on_internet_graph_func(combined_summary_df, rare_on_internet__
                     logger.exception('Encountered error adding link to rare on internet graph structure')
     current_graph = {'nodes': nodes_list, 'links': links_list}
     #print('current_graph', current_graph)
-    current_graph_json = json.dumps(current_graph)
+    current_graph_json = json.dumps(current_graph, indent=4, ensure_ascii=False)
     return current_graph_json
 
 
@@ -202,7 +206,7 @@ def generate_alt_rare_on_internet_graph_func(list_of_images_as_base64__filtered,
                 except BaseException as e:
                     logger.exception('Encountered error adding link to alternative rare on internet graph structure')
     current_graph = {'nodes': nodes_list, 'links': links_list}
-    current_graph_json = json.dumps(current_graph)
+    current_graph_json = json.dumps(current_graph, indent=4, ensure_ascii=False)
     return current_graph_json
 
 def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
@@ -214,11 +218,10 @@ def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
 
 
 class ChromeDriver:
-    WEBTOOLS_VERSION = "1.2"
+    WEBTOOLS_VERSION = "1.3"
     MAX_SEARCH_RESULTS = 50
 
-    def __init__(self, config: Config, img: DDImage):
-        chromedriver_autoinstaller.install()
+    def __init__(self, config: Config, img: DDImage, chromedriver_path: str, chrome_user_data_dir: str):
         chrome_options = webdriver.ChromeOptions()
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--window-size=1920,1200")
@@ -226,11 +229,26 @@ class ChromeDriver:
         # chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--start-maximized")
         chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-        chrome_options.add_experimental_option("useAutomationExtension", False)
-        prefs = {"download.default_directory": str(config.internet_rareness_downloaded_images_path)}
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument(f"--user-data-dir={chrome_user_data_dir}")
+        chrome_service_args = []
+        if config.enable_chromedriver_logging:
+            chrome_service_args.append("--verbose")
+            chrome_service_args.append(f"--log-path={str(config.log_files_path / f'chromedriver_{os.getpid()}.log')}")
+        prefs = {
+            # specifies where to download files to by default
+            "download.default_directory": str(config.internet_rareness_downloaded_images_path),
+            #  whether we should ask the user if we should download a file (true) or just download it automatically
+            "download.prompt_for_download": False,
+            # if the download directory was changed by an upgrade from unsafe location to a safe location
+            "download.directory_upgrade": True
+        }
         chrome_options.add_experimental_option("prefs", prefs)
         self.resized_image_save_path = None
-        self.driver = webdriver.Chrome(options=chrome_options)  # executable_path=chromedriver_path,
+        self.driver = webdriver.Chrome(
+            executable_path=chromedriver_path,
+            options=chrome_options,
+            service_args=chrome_service_args)
         # self.driver.implicitly_wait(3)
         self.config = config
         self.img = img
@@ -242,7 +260,7 @@ class ChromeDriver:
         model = nn.DataParallel(model)
         model.module.classifier = None
         checkpoint_file = str(self.config.support_files_path / 'DupeDetector_gray.pth.tar')
-        print("Loading checkpoint... ", checkpoint_file)
+        logger.info(f"Loading checkpoint... {checkpoint_file}")
         ckpt = torch.load(checkpoint_file)
         model.load_state_dict(ckpt,strict = True)
         model.module.base[10] =  GeneralizedMeanPoolingP(3)
@@ -347,13 +365,13 @@ class ChromeDriver:
         score_norms = train_scores.mean(axis=1) * 2
         cos_scores = cos_scores - score_norms
         min_normalized_cos_similarity_threshold__lowest_permissible = -0.1
-        target_pct_of_results_to_keep = 0.25
-        print('Target percentage of results to keep: ', target_pct_of_results_to_keep)
+        min_target_pct_of_results_to_keep = 0.15
+        logger.info(f'Minimum target percentage of results to keep: {min_target_pct_of_results_to_keep}')
         if img_count >= 3:
             min_normalized_cos_similarity_threshold = 0.05
             number_of_images_above_similarity_threshold = np.sum([(x > min_normalized_cos_similarity_threshold).astype(int) for idx, x in enumerate(cos_scores)])
             pct_of_images_above_similarity_threshold = number_of_images_above_similarity_threshold / len(cos_scores)
-            while ( (pct_of_images_above_similarity_threshold < target_pct_of_results_to_keep) and (min_normalized_cos_similarity_threshold >= min_normalized_cos_similarity_threshold__lowest_permissible) ):
+            while ( (pct_of_images_above_similarity_threshold < min_target_pct_of_results_to_keep) and (min_normalized_cos_similarity_threshold >= min_normalized_cos_similarity_threshold__lowest_permissible) ):
                 # print('Current minimum normalized cosine similarity threshold: ', min_normalized_cos_similarity_threshold)
                 # print('Current number of results above the min. threshold: ', number_of_images_above_similarity_threshold)
                 # print('Current percentage of results above the min. threshold: ', pct_of_images_above_similarity_threshold)
@@ -418,10 +436,18 @@ class ChromeDriver:
             status, current_page_results_df = self.try_to_get_table_from_page_old()
             return status, current_page_results_df
         try:
-            list_of_date_strings = [list(set(list(datefinder.find_dates(x)))) for x in sokoban_element_more_strings]
-            list_of_date_strings_fixed = [x[0].isoformat().split('T0')[0].replace(' ','_').replace(':','_') if len(x) > 0 else '' for x in list_of_date_strings]
+            list_of_date_strings = [remove_dupes_from_list_but_preserve_order_func(list(datefinder.find_dates(text=x, strict=True))) for x in sokoban_element_more_strings]
+            list_of_date_strings_fixed = []
+            for _, current_date_list in enumerate(list_of_date_strings):
+                for current_date in current_date_list:
+                    if current_date > datetime.now() - timedelta(days=2):
+                        current_date_list.remove(current_date)
+                if len(current_date_list) > 0:                       
+                    list_of_date_strings_fixed.append(min(current_date_list).isoformat().split('T0')[0].replace(' ','_').replace(':','_'))
+                else:
+                    list_of_date_strings_fixed.append('')
         except BaseException as e:
-            logger.exception('Error encountered parsing dates in the rare on the internet results-- trying again a different way...')
+            logger.exception('Error encountered parsing dates in the rare on the internet results...')
             page_source_text = self.driver.page_source
             problem_files_path = self.config.support_files_path / 'rare_on_the_internet_problem_pages'
             problem_files_path.mkdir(parents=True, exist_ok=True)
@@ -430,24 +456,6 @@ class ChromeDriver:
             print('\nSaving problem page to disk for analysis: ' + problem_page_output_path)
             with open(problem_page_output_path, 'w') as f:
                 f.write(page_source_text)
-            list_of_date_strings_fixed = []
-            for current_potential_date_string in sokoban_element_more_strings:
-                current_date_string = ''
-                current_date_string_fixed = ''
-                try:
-                    current_date_string = list(datefinder.find_dates(current_potential_date_string))
-                except:
-                    print('Could not parse date from string: ', current_potential_date_string)
-                if len(current_date_string) > 0:
-                    try:
-                        if current_date_string[0].isoformat() <= datetime.now():
-                            current_date_string_fixed = current_date_string[0].isoformat().split('T0')[0].replace(' ','_').replace(':','_')
-                        else:
-                            print('Date was from the future, so obviously invalid! Ignoring...')
-                            current_date_string_fixed = ''
-                    except:
-                        print('Could not parse date from string: ', current_date_string)
-                list_of_date_strings_fixed.append(current_date_string_fixed)
         try:
             print('list_of_date_strings_fixed: ', list_of_date_strings_fixed)
             list_of_original_urls = [x.split(' href="')[1].split('" ping="')[0].split('">')[0].strip() for x in sokoban_element_more_strings]
@@ -527,7 +535,7 @@ class ChromeDriver:
                             raise NoSuchElementException('Image title not found')
                         soup_text = soup.get_text()
                         list_of_a_elements = soup.find_all('a')
-                        list_of_href_elements = list(set([x.get('href') for x in list_of_a_elements if re.match("^http",x.get('href')) != None ]))
+                        list_of_href_elements = remove_dupes_from_list_but_preserve_order_func([x.get('href') for x in list_of_a_elements if re.match("^http",x.get('href')) != None ])
                         print("list of href elements: ",("\n\t").join(list_of_href_elements))
                         cached_url = ''
                         primary_url = ''
@@ -554,7 +562,7 @@ class ChromeDriver:
                         date = ''
                         date_string_fixed = ''
                         if('—' in description):
-                            date_string = list(set(list(datefinder.find_dates(description))))
+                            date_string = remove_dupes_from_list_but_preserve_order_func(list(datefinder.find_dates(text=description, strict=True)))
                             if len(date_string) > 0:
                                 date_string_fixed = date_string[0].isoformat().split('T0')[0].replace(' ','_').replace(':','_')
                         print("Date: ", date_string_fixed)
@@ -619,16 +627,6 @@ class ChromeDriver:
                     number_of_tries_so_far = number_of_tries_so_far + 1
                     with ScopeTimer():
                         extraction_successful, summary_df = self.try_to_get_table_from_page()
-                        # if len(summary_df) == 0:
-                        #     print('Rare on the internet table is empty... trying again using alternative approach:')
-                        #     page_source_text = self.driver.page_source
-                        #     problem_files_path = pathlib.Path(self.config.support_files_path + 'rare_on_the_internet_problem_pages/')
-                        #     problem_files_path.mkdir(parents=True, exist_ok=True)
-                        #     problem_page_output_path = str(problem_files_path) + '/main_code__problem_page__' + datetime.now().strftime("%Y_%m_%d__%H_%M_%S") + '.html'
-                        #     print('\nSaving problem page to disk for analysis: ' + problem_page_output_path)
-                        #     with open(problem_page_output_path, 'w') as f:
-                        #         f.write(page_source_text)
-                        #     extraction_successful, summary_df = self.try_to_get_table_from_page_old()
             else:
                 while (not extraction_successful) and (number_of_tries_so_far < number_of_times_to_try_new_code_before_reverting_to_old_code):
                     number_of_tries_so_far = number_of_tries_so_far + 1
@@ -657,15 +655,12 @@ class ChromeDriver:
                 time.sleep(random.uniform(0.2, 0.6))
             except BaseException as e:
                 logger.exception('Encountered Error scrolling to bottom for next page element')
-
         try:
             list_of_sub_tables = [x for x in list_of_summary_dfs if len(x) > 0]
             if len(list_of_sub_tables) > 0:
                 combined_summary_df = pd.concat(list_of_sub_tables, axis=0)
                 #print("combined_summary_df length before drop dupes: " + str(len(combined_summary_df)))
-                #combined_summary_df = combined_summary_df.drop_duplicates(subset=['result_title', 'title_y_coordinate'])
                 combined_summary_df = combined_summary_df.drop_duplicates(subset=['title'])
-                #print("combined_summary_df length after drop dupe titles: " + str(len(combined_summary_df)))
                 if 'img_src_string' in combined_summary_df.columns.tolist():
                     combined_summary_df = combined_summary_df.dropna(subset=['img_src_string'])
                     combined_summary_df = combined_summary_df[
@@ -859,7 +854,7 @@ class ChromeDriver:
                                            'list_of_sha3_256_hashes_of_images_as_base64': alt_list_of_image_base64_hashes_filtered,
                                            'list_of_href_strings': list_of_href_strings__filtered,
                                            'alternative_rare_on_internet_graph_json_compressed_b64': alternative_rare_on_internet_graph_json_compressed_b64}
-            dict_of_google_lens_results_as_json = json.dumps(dict_of_google_lens_results)
+            dict_of_google_lens_results_as_json = json.dumps(dict_of_google_lens_results, indent=4, ensure_ascii=False)
             return dict_of_google_lens_results_as_json
         except BaseException as e:
             logger.exception('Problem getting Google Lens data')
@@ -952,7 +947,6 @@ class ChromeDriver:
                     time.sleep(random.uniform(2.5, 5))
                     logger.info('Now attempting to click "Find image source" button...')
                     WebDriverWait(self.driver, 15).until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@aria-label, 'Find image source')]")))
-                    #WebDriverWait(self.driver, 15).until(lambda wd: wd.find_element(By.XPATH,  "//a[contains(@aria-label, 'Find image source')]"))
                     find_image_source_buttons = self.driver.find_elements(By.XPATH, "//a[contains(@aria-label, 'Find image source')]")
                     for current_button in find_image_source_buttons:
                         try:
@@ -1084,29 +1078,6 @@ class ChromeDriver:
                             time.sleep(random.uniform(0.1, 0.2))
                         except:
                             pass
-                # list_of_buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Upload')]")
-                # EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Upload')]"))
-                # if len(list_of_buttons) > 0:
-                #     for current_button in list_of_buttons:
-                #         try:
-                #             actions = ActionChains(self.driver)
-                #             actions.move_to_element(current_button)
-                #             actions.click(on_element=current_button)
-                #             actions.perform()
-                #             time.sleep(random.uniform(0.1, 0.2))
-                #         except:
-                #             pass
-                # list_of_buttons2 = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Computer')]")
-                # if len(list_of_buttons2) > 0:
-                #     for current_button in list_of_buttons2:
-                #         try:
-                #             actions = ActionChains(self.driver)
-                #             actions.move_to_element(current_button)
-                #             actions.click(on_element=current_button)
-                #             actions.perform()
-                #             time.sleep(random.uniform(0.1, 0.2))
-                #         except:
-                #             pass
                 time.sleep(random.uniform(0.5, 1.0))
                 choose_file_button_element = self.driver.find_element(By.XPATH, "//input[@type='file']")
                 if choose_file_button_element is not None:
@@ -1134,8 +1105,8 @@ class ChromeDriver:
                             current_url]
                 list_of_urls_of_images_in_page__clean = [x.split('imgurl=')[-1].split('&imgrefurl')[0] for x in
                                                          list_of_urls_of_images_in_page]
-                list_of_urls_of_images_in_page__clean = list(set(list_of_urls_of_images_in_page__clean))
-                list_of_urls_of_visually_similar_images = list(set(list_of_urls_of_visually_similar_images))
+                list_of_urls_of_images_in_page__clean = remove_dupes_from_list_but_preserve_order_func(list_of_urls_of_images_in_page__clean)
+                list_of_urls_of_visually_similar_images = remove_dupes_from_list_but_preserve_order_func(list_of_urls_of_visually_similar_images)
                 status_result = 1
         except BaseException as e:
             logger.exception('Encountered Error')
@@ -1157,7 +1128,7 @@ class ChromeDriver:
                     current_search_start_string = current_url.split('&start=')[-1].split('&')[0]
                     list_of_search_results_start_strings = list_of_search_results_start_strings + [
                         current_search_start_string]
-            list_of_search_results_start_strings = list(set(list_of_search_results_start_strings))
+            list_of_search_results_start_strings = remove_dupes_from_list_but_preserve_order_func(list_of_search_results_start_strings)
             number_of_pages_of_results__method_1 = max([1, len(list_of_search_results_start_strings)])
             pager_elements_on_page = self.driver.find_elements(By.XPATH, "//a[contains(@aria-label, 'Page ')]")
             number_of_pages_of_results__method_2 = len(pager_elements_on_page) + 1

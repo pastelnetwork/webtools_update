@@ -49,7 +49,7 @@ class RemoteCodeUpdater:
         FAILED_GET_PUBLIC_KEY = -4
         FAILED_BACKUP = -5
         FAILED_UPDATE_FILE = -6
-        FAILED_SIGNATURE_INVALID = -7
+        FAILED_SINGATURE_INVALID = -7
         FAILED_UNKNOWN_EXCEPTION = -8
         FAILED_ROLLBACK_FILE = -9
     
@@ -220,7 +220,7 @@ class RemoteCodeUpdater:
                             
         except BadSignatureError:
             self.logger.info(f'The signature for {self.filename} is invalid')
-            return self.UpdateStatus.FAILED_SIGNATURE_INVALID
+            return self.UpdateStatus.FAILED_SINGATURE_INVALID
         except Exception as exc:
             self.logger.exception(f"Exception occurred while updating '{self.filename}'")
             return self.UpdateStatus.FAILED_UNKNOWN_EXCEPTION
