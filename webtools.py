@@ -23,7 +23,6 @@ import zstandard as zstd
 from contextlib import contextmanager
 import _thread
 
-import chromedriver_autoinstaller
 from PIL import Image
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -219,11 +218,10 @@ def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
 
 
 class ChromeDriver:
-    WEBTOOLS_VERSION = "1.2"
+    WEBTOOLS_VERSION = "1.3"
     MAX_SEARCH_RESULTS = 50
 
-    def __init__(self, config: Config, img: DDImage):
-        chromedriver_autoinstaller.install()
+    def __init__(self, config: Config, img: DDImage, chromedriver_path: str, chrome_user_data_dir: str):
         chrome_options = webdriver.ChromeOptions()
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--window-size=1920,1200")
@@ -231,11 +229,26 @@ class ChromeDriver:
         # chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--start-maximized")
         chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-        chrome_options.add_experimental_option("useAutomationExtension", False)
-        prefs = {"download.default_directory": str(config.internet_rareness_downloaded_images_path)}
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument(f"--user-data-dir={chrome_user_data_dir}")
+        chrome_service_args = []
+        if config.enable_chromedriver_logging:
+            chrome_service_args.append("--verbose")
+            chrome_service_args.append(f"--log-path={str(config.log_files_path / f'chromedriver_{os.getpid()}.log')}")
+        prefs = {
+            # specifies where to download files to by default
+            "download.default_directory": str(config.internet_rareness_downloaded_images_path),
+            #  whether we should ask the user if we should download a file (true) or just download it automatically
+            "download.prompt_for_download": False,
+            # if the download directory was changed by an upgrade from unsafe location to a safe location
+            "download.directory_upgrade": True
+        }
         chrome_options.add_experimental_option("prefs", prefs)
         self.resized_image_save_path = None
-        self.driver = webdriver.Chrome(options=chrome_options)  # executable_path=chromedriver_path,
+        self.driver = webdriver.Chrome(
+            executable_path=chromedriver_path,
+            options=chrome_options,
+            service_args=chrome_service_args)
         # self.driver.implicitly_wait(3)
         self.config = config
         self.img = img
@@ -247,7 +260,7 @@ class ChromeDriver:
         model = nn.DataParallel(model)
         model.module.classifier = None
         checkpoint_file = str(self.config.support_files_path / 'DupeDetector_gray.pth.tar')
-        print("Loading checkpoint... ", checkpoint_file)
+        logger.info(f"Loading checkpoint... {checkpoint_file}")
         ckpt = torch.load(checkpoint_file)
         model.load_state_dict(ckpt,strict = True)
         model.module.base[10] =  GeneralizedMeanPoolingP(3)
@@ -352,8 +365,8 @@ class ChromeDriver:
         score_norms = train_scores.mean(axis=1) * 2
         cos_scores = cos_scores - score_norms
         min_normalized_cos_similarity_threshold__lowest_permissible = -0.1
-        min_target_pct_of_results_to_keep = 0.25
-        print('Minimum target percentage of results to keep: ', min_target_pct_of_results_to_keep)
+        min_target_pct_of_results_to_keep = 0.15
+        logger.info(f'Minimum target percentage of results to keep: {min_target_pct_of_results_to_keep}')
         if img_count >= 3:
             min_normalized_cos_similarity_threshold = 0.05
             number_of_images_above_similarity_threshold = np.sum([(x > min_normalized_cos_similarity_threshold).astype(int) for idx, x in enumerate(cos_scores)])
@@ -423,9 +436,9 @@ class ChromeDriver:
             status, current_page_results_df = self.try_to_get_table_from_page_old()
             return status, current_page_results_df
         try:
-            list_of_date_strings = [remove_dupes_from_list_but_preserve_order_func(list(datefinder.find_dates(x))) for x in sokoban_element_more_strings]
+            list_of_date_strings = [remove_dupes_from_list_but_preserve_order_func(list(datefinder.find_dates(text=x, strict=True))) for x in sokoban_element_more_strings]
             list_of_date_strings_fixed = []
-            for indx, current_date_list in enumerate(list_of_date_strings):
+            for _, current_date_list in enumerate(list_of_date_strings):
                 for current_date in current_date_list:
                     if current_date > datetime.now() - timedelta(days=2):
                         current_date_list.remove(current_date)
@@ -490,7 +503,6 @@ class ChromeDriver:
             WebDriverWait(self.driver, 10).until(lambda wd: len([el for el in wd.find_element(By.ID,"search").find_elements(By.XPATH,'.//img') if el.is_displayed()])>3)
         except Exception as e: 
             logger.exception('Error encountered trying to find the "search" element on the page using the ID field...')
-            logger.exception('Error: ' + str(e))            
         try:
             search_element = self.driver.find_element(By.ID, 'search')
         except BaseException as e:
@@ -550,7 +562,7 @@ class ChromeDriver:
                         date = ''
                         date_string_fixed = ''
                         if('—' in description):
-                            date_string = remove_dupes_from_list_but_preserve_order_func(list(datefinder.find_dates(description)))
+                            date_string = remove_dupes_from_list_but_preserve_order_func(list(datefinder.find_dates(text=description, strict=True)))
                             if len(date_string) > 0:
                                 date_string_fixed = date_string[0].isoformat().split('T0')[0].replace(' ','_').replace(':','_')
                         print("Date: ", date_string_fixed)
@@ -687,7 +699,6 @@ class ChromeDriver:
             status_result = 1
         except BaseException as e:
             logger.exception('Encountered Error combining sub-tables into combined table')
-            logger.exception('Error: ' + str(e))            
             combined_summary_df = pd.DataFrame()
             current_graph_json = ''
             #this would seem to indicate that there was an actual error in processing vs 0 results, so send a status result that causes us to try old code
@@ -707,7 +718,6 @@ class ChromeDriver:
                 logger.info('No exact image matches found in page!')
         except BaseException as e:
             logger.exception('Encountered Error getting min number of exact matches in page')
-            logger.exception('Error: ' + str(e))            
             min_number_of_exact_matches_in_page = 0
         return status_result, combined_summary_df, min_number_of_exact_matches_in_page, current_graph_json
 
@@ -832,7 +842,6 @@ class ChromeDriver:
                                                                                   alt_rare_on_internet__adjacency_df)
                 except BaseException as e:
                     logger.exception('Encountered problem filtering out dissimilar images from Google Lens data')
-                    logger.exception('Error: ' + str(e))            
             else:
                 list_of_images_as_base64__filtered = list_of_images_as_base64
                 alt_list_of_image_base64_hashes_filtered = [get_sha256_hash_of_input_data_func(x) for x in list_of_images_as_base64]
@@ -938,7 +947,6 @@ class ChromeDriver:
                     time.sleep(random.uniform(2.5, 5))
                     logger.info('Now attempting to click "Find image source" button...')
                     WebDriverWait(self.driver, 15).until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@aria-label, 'Find image source')]")))
-                    #WebDriverWait(self.driver, 15).until(lambda wd: wd.find_element(By.XPATH,  "//a[contains(@aria-label, 'Find image source')]"))
                     find_image_source_buttons = self.driver.find_elements(By.XPATH, "//a[contains(@aria-label, 'Find image source')]")
                     for current_button in find_image_source_buttons:
                         try:
@@ -983,7 +991,6 @@ class ChromeDriver:
                         status_result = 1
         except BaseException as e:
             logger.exception('Encountered Error with "Rare on Internet" check')
-            logger.exception('Error: ' + str(e))            
             status_result = 0
         return status_result
 
@@ -1080,7 +1087,6 @@ class ChromeDriver:
                 status_result = 1
             except BaseException as e:
                 logger.exception('Problem getting Google lens data')
-                logger.exception('Error: ' + str(e))            
         return status_result, resized_image_save_path
 
     def get_list_of_similar_images_func(self):
@@ -1104,7 +1110,6 @@ class ChromeDriver:
                 status_result = 1
         except BaseException as e:
             logger.exception('Encountered Error')
-            logger.exception('Error: ' + str(e))            
             list_of_urls_of_images_in_page__clean = list()
         return status_result, list_of_urls_of_images_in_page__clean, list_of_urls_of_visually_similar_images
 
@@ -1139,5 +1144,4 @@ class ChromeDriver:
 
         except BaseException as e:
             logger.exception('Encountered Error getting number of pages of search results')
-            logger.exception('Error: ' + str(e))            
         return number_of_pages_of_results
