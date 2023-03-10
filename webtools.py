@@ -218,12 +218,12 @@ def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
 
 
 class ChromeDriver:
-    WEBTOOLS_VERSION = "1.3"
+    WEBTOOLS_VERSION = "1.4"
     MAX_SEARCH_RESULTS = 50
 
     def __init__(self, config: Config, img: DDImage, chromedriver_path: str, chrome_user_data_dir: str):
         chrome_options = webdriver.ChromeOptions()
-        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--window-size=1920,1200")
         chrome_options.add_argument("--disable-gpu")
         # chrome_options.add_argument("--no-sandbox")
@@ -330,13 +330,10 @@ class ChromeDriver:
         all_desc_r = []
         img_count = len(list_of_images_as_base64)
         logger.info(f"pre-processing {img_count} images")
-        mem_size = psutil.virtual_memory()[3]
         for r_str in range(img_count):
             features = model.module.base(preprocess_image(base64_to_preimage(list_of_images_as_base64[r_str])))
             list_of_images_as_base64[r_str] = None
             features = features.view(features.size(0), -1)
-            mem_size_old = mem_size
-            mem_size = psutil.virtual_memory()[3]
             all_desc_r.append(features)
         logger.info(f"RAM used {psutil.virtual_memory()[3]}")
         all_desc_r = torch.vstack(tuple(all_desc_r)).cpu().detach().numpy()
