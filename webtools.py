@@ -44,6 +44,7 @@ from utils import (
     get_sha3_256_from_data,
     get_hash_sha3_256_from_file,
     is_in_debugger,
+    Timer,
 )
 from image_utils import (
     DDImage,
@@ -61,10 +62,15 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
+WEBTOOLS_VERSION = "1.9"
 SERVED_FILES_PATH = os.path.expanduser('~/pastel_dupe_detection_service/img_server/')
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 90
 METADATA_DOWNLOAD_MAX_WORKERS = 15
+METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES = 5000
+MAX_SEARCH_RESULTS = 60
+MAX_RESULTS_TO_RETURN = 15
+IMAGE_PROCESSING_BATCH_SIZE = 20
 
 class TimeoutException(Exception):
     def __init__(self, msg=''):
@@ -217,8 +223,9 @@ def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
 
 def get_all_images_on_page_as_base64_encoded_strings(executor: concurrent.futures.ThreadPoolExecutor,
                                                      html_of_page: str,
-                                                     min_image_size_to_retrieve: int = 5000,
-                                                     timeout_in_secs: float = 90) -> Tuple[List[str], List[str]]:
+                                                     min_image_size_to_retrieve: int = METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES,
+                                                     timeout_in_secs: float = METADATA_DOWNLOAD_TIMEOUT_SECS,
+                                                     max_results_to_collect: int = MAX_SEARCH_RESULTS) -> Tuple[List[str], List[str]]:
     soup = BeautifulSoup(html_of_page, "lxml")
     img_elements = soup.find_all("img")
     
@@ -230,17 +237,35 @@ def get_all_images_on_page_as_base64_encoded_strings(executor: concurrent.future
     futures = {executor.submit(get_image_url_data, url, min_image_size_to_retrieve): url for url in image_urls}
     
     for future in concurrent.futures.as_completed(futures, timeout=timeout_in_secs):
+        if len(list_of_base64_encoded_images) >= max_results_to_collect:
+            logger.info(f'Reached max img elements to collect: {max_results_to_collect}. Stopping further retrieval.')
+            break
+        
         try:
             base64_image, image_url = future.result()
             if base64_image and image_url:
                 list_of_base64_encoded_images.append(base64_image)
                 list_of_corresponsing_image_urls.append(image_url)
         except concurrent.futures.TimeoutError:
+            urls = []
             for future, url in futures.items():
                 if not future.done():
-                    logger.warning(f"Image url='{url}' could not be retrieved in {timeout_in_secs} seconds.")
+                    urls.append(url)
                     future.cancel()
-                
+            if len(urls) > 0:
+                urls_string = '\n'.join(urls)
+                logger.warning(f"Images ({len(urls)}) that could not be retrieved in {timeout_in_secs} seconds:\n{urls_string}")
+                    
+    # Cancel remaining futures if we reached the maximum number of results we want to collect                    
+    urls = [] 
+    for future, url in futures.items():
+        if not future.done() and not future.cancelled():
+            urls.append(url)
+            future.cancel()    
+    if len(urls) > 0:
+        urls_string = '\n'.join(urls)
+        logger.info(f"Images ({len(urls)}) retrieval was cancelled - max results {max_results_to_collect} reached:\n{urls_string}")
+    
     return list_of_base64_encoded_images, list_of_corresponsing_image_urls
 
 
@@ -294,10 +319,7 @@ def get_fields_from_image_result(current_result):
 
 
 class ChromeDriver:
-    WEBTOOLS_VERSION = "1.8"
-    MAX_SEARCH_RESULTS = 50
-    MAX_RESULTS_TO_RETURN = 15
-
+    
     def __init__(self, img: DDImage, chromedriver_path: str, chrome_user_data_dir: str):
         if chromedriver_path is None or chromedriver_path == '':
             raise ValueError('ChromeDriver path is empty')
@@ -355,7 +377,7 @@ class ChromeDriver:
             self.loop = asyncio.get_event_loop()
         except RuntimeError:
             self.loop = asyncio.new_event_loop()       
-        logger.info(f'Initialized webtools v{self.WEBTOOLS_VERSION}')
+        logger.info(f'Initialized webtools v{WEBTOOLS_VERSION}')
 
 
     def __del__(self):
@@ -371,7 +393,8 @@ class ChromeDriver:
         
        
     def get_additional_metadata_for_url(self, executor: concurrent.futures.ThreadPoolExecutor,
-                                        input_url: str, input_title_string: str, timeout_in_secs: float):
+                                        input_url: str, input_title_string: str, timeout_in_secs: float,
+                                        max_results_to_collect: int = MAX_SEARCH_RESULTS):
         corresponding_description_string = ''
         list_of_date_strings_fixed = []
         list_of_base64_encoded_images = []
@@ -395,11 +418,12 @@ class ChromeDriver:
                 else:
                     list_of_date_strings_fixed = []
                 list_of_base64_encoded_images, list_of_corresponsing_image_urls = \
-                        get_all_images_on_page_as_base64_encoded_strings(executor, underlying_url_html, min_image_size_to_retrieve=5000, timeout_in_secs=timeout_in_secs)
+                        get_all_images_on_page_as_base64_encoded_strings(executor, underlying_url_html, min_image_size_to_retrieve=METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES,
+                                                                         timeout_in_secs=timeout_in_secs, max_results_to_collect=max_results_to_collect)
             except Exception as e:
-                logger.info(f'Could not retrieve additional metadata for {input_url}. {str(e)}')
+                logger.info(f'Could not retrieve additional metadata for [{input_url}]. {str(e)}')
         else:
-            logger.info(f"Could not retrieve additional metadata for '{input_url}''. Page load time may exceed {timeout_in_secs} seconds.")
+            logger.info(f"Could not retrieve additional metadata for [{input_url}]. Page load time may exceed {timeout_in_secs} seconds.")
         return corresponding_description_string, list_of_date_strings_fixed, list_of_base64_encoded_images, list_of_corresponsing_image_urls
 
 
@@ -425,6 +449,7 @@ class ChromeDriver:
                      'misc_related_image_as_b64_string'],
             index=pd.Index([], name='search_result_ranking'))
         
+        timer = Timer(True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=METADATA_DOWNLOAD_MAX_WORKERS) as executor:
             images_hashes = set()
             current_index = 0
@@ -432,9 +457,10 @@ class ChromeDriver:
                 title_string, primary_url, img_src, resolution = get_fields_from_image_result(current_result)
                 # stop enumeration if we collected MAX_SEARCH_RESULTS images
                 image_count = len(combined_summary_df)
-                if image_count < self.MAX_SEARCH_RESULTS:
-                    logger.info(f'Collected {image_count} images. Getting additional metadata for URL: {primary_url}...')
-                    future = executor.submit(self.get_additional_metadata_for_url, executor, primary_url, title_string, METADATA_DOWNLOAD_TIMEOUT_SECS)
+                if image_count < MAX_SEARCH_RESULTS:
+                    logger.info(f'Collected {image_count} images. Getting additional metadata for URL [{primary_url}]...')
+                    future = executor.submit(self.get_additional_metadata_for_url, executor, primary_url, title_string,
+                                             METADATA_DOWNLOAD_TIMEOUT_SECS, MAX_SEARCH_RESULTS - image_count)
                     try:
                         description, list_of_date_strings_fixed, list_of_base64_encoded_images, list_of_corresponsing_image_urls = \
                             future.result(timeout=METADATA_DOWNLOAD_TIMEOUT_SECS)
@@ -444,7 +470,7 @@ class ChromeDriver:
                             future.cancel()
                         continue
                 else:
-                    logger.info(f"Collected total {image_count} images")
+                    logger.info(f"Collected total {image_count} images in {timer.elapsed_time:.3f} secs")
                     break
                 date_string = "|".join(list_of_date_strings_fixed)
                 # keep only images with correct base64 encoding and remove duplicates
@@ -481,17 +507,17 @@ class ChromeDriver:
             combined_list_of_base64_encoded_images = combined_summary_df['misc_related_image_as_b64_string'].values.tolist()
             search_images = [ImageDataPreProcessedBase64String(base64_encoded_data) for base64_encoded_data in combined_list_of_base64_encoded_images]
             indices_to_keep, _, rare_on_internet__similarity_df, rare_on_internet__adjacency_df = \
-                filter_out_dissimilar_images_batch('google image search results', self.resized_image_save_path, search_images, 20)
-            if len(indices_to_keep) < self.MAX_RESULTS_TO_RETURN:
+                filter_out_dissimilar_images_batch('google image search results', self.resized_image_save_path, search_images, IMAGE_PROCESSING_BATCH_SIZE)
+            if len(indices_to_keep) < MAX_RESULTS_TO_RETURN:
                 logger.info(f'Keeping {len(indices_to_keep)} of {len(search_images)} '
                             'google reverse image search images that are above the similarity score threshold.')
             else:
-                logger.info(f'Keeping {self.MAX_RESULTS_TO_RETURN} of {len(search_images)} '
+                logger.info(f'Keeping {MAX_RESULTS_TO_RETURN} of {len(search_images)} '
                             'google reverse image search images that are above the similarity score threshold '
                            f'(truncated from {len(indices_to_keep)} images).')
-                indices_to_keep = indices_to_keep[:self.MAX_RESULTS_TO_RETURN]
-                rare_on_internet__similarity_df = rare_on_internet__similarity_df.head(self.MAX_RESULTS_TO_RETURN)
-                rare_on_internet__adjacency_df = rare_on_internet__adjacency_df.head(self.MAX_RESULTS_TO_RETURN)
+                indices_to_keep = indices_to_keep[:MAX_RESULTS_TO_RETURN]
+                rare_on_internet__similarity_df = rare_on_internet__similarity_df.head(MAX_RESULTS_TO_RETURN)
+                rare_on_internet__adjacency_df = rare_on_internet__adjacency_df.head(MAX_RESULTS_TO_RETURN)
                 
             filtered_combined_summary_df = combined_summary_df.loc[indices_to_keep]
             # replace image data with resampled from search_images
@@ -563,6 +589,19 @@ class ChromeDriver:
         self.remove_old_served_image_files_func()
         return destination_path, destination_url
 
+    def is_jquery_loaded(self):
+        """
+        Check if the page is using Ajax (jQuery) to load content
+        
+        Returns:
+            bool: True if jQuery is loaded, False otherwise
+        """
+        try:
+            is_loaded = self.driver.execute_script("return typeof jQuery != 'undefined'")
+        except Exception as exc:
+            is_loaded = False
+        return is_loaded
+    
 
     def extract_data_from_google_lens_page_func(self):
         list_of_images_as_base64__filtered = []
@@ -573,10 +612,20 @@ class ChromeDriver:
         try:
             logger.info('Attempting to retrieve Google Lens results for image...')
             status_result__google_lens, resized_image_save_path = self.search_google_lens_for_image_func()
+            # wait for Ajax calls to complete
+            if self.is_jquery_loaded():
+                try:
+                    logger.info('Waiting for jQuery Ajax calls to complete...')
+                    WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script("return jQuery.active == 0"))
+                    logger.info('...jQuery loaded')
+                except TimeoutException:
+                    logger.warning('Timed out waiting for jQuery Ajax calls to complete. Proceeding with parsing the page as it is.')
+                    
             logger.info('Waiting for elements to be visible...')
             WebDriverWait(self.driver, 15).until(lambda wd: wd.find_element(By.XPATH, "//*[contains(text(), 'Visual matches')]"))
-            logger.info('Last wait')
-            time.sleep(random.uniform(2, 4))
+            logger.info('Waiting for the page to load...')
+            WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')            
+            logger.info('...page is loaded!')
             logger.info('Parsing page with BeautifulSoup...')
             soup = BeautifulSoup(self.driver.page_source, "lxml")    
             logger.info('Done parsing page!')
@@ -589,11 +638,11 @@ class ChromeDriver:
             list_of_href_strings = [(x.split('" href="'))[1].split('" role="')[0] for x in a_elements_filtered_strings]
             logger.info('Getting images and storing as base64 strings...')
             logger.info('Done!')
-            if len(list_of_img_src_strings) > self.MAX_SEARCH_RESULTS:
-                logger.info(f"Truncating image search results [{len(list_of_img_src_strings)}] -> [{self.MAX_SEARCH_RESULTS}]")
-                list_of_alt_strings = list_of_alt_strings[:self.MAX_SEARCH_RESULTS]                    
-                list_of_img_src_strings = list_of_img_src_strings[:self.MAX_SEARCH_RESULTS]                    
-                list_of_href_strings = list_of_href_strings[:self.MAX_SEARCH_RESULTS]
+            if len(list_of_img_src_strings) > MAX_SEARCH_RESULTS:
+                logger.info(f"Truncating image search results [{len(list_of_img_src_strings)}] -> [{MAX_SEARCH_RESULTS}]")
+                list_of_alt_strings = list_of_alt_strings[:MAX_SEARCH_RESULTS]                    
+                list_of_img_src_strings = list_of_img_src_strings[:MAX_SEARCH_RESULTS]                    
+                list_of_href_strings = list_of_href_strings[:MAX_SEARCH_RESULTS]
             current_graph_json = ''
             list_of_images_as_base64__filtered = []
             alt_list_of_image_base64_hashes_filtered = []
@@ -602,7 +651,7 @@ class ChromeDriver:
                     list_of_images = [ImageDataPreProcessedUrl(image_src_url) for image_src_url in list_of_img_src_strings]
                     list_of_image_indices_to_keep, alt_list_of_image_base64_hashes_filtered, \
                     alt_rare_on_internet__similarity_df, alt_rare_on_internet__adjacency_df = \
-                        filter_out_dissimilar_images_batch('google lens results', self.resized_image_save_path, list_of_images, 20)
+                        filter_out_dissimilar_images_batch('google lens results', self.resized_image_save_path, list_of_images, IMAGE_PROCESSING_BATCH_SIZE)
                     logger.info(f'Keeping {len(list_of_image_indices_to_keep)} of {len(list_of_images)} google lens images that are above the similarity score threshold.')
                     if len(list_of_image_indices_to_keep) > 0:
                         list_of_img_src_strings__filtered = np.array(list_of_img_src_strings)[list_of_image_indices_to_keep].tolist()
