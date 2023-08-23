@@ -12,10 +12,11 @@ import random
 import base64
 import json
 import gc
-import nest_asyncio
-import concurrent.futures
-nest_asyncio.apply() # patch asyncio to allow nested event loops
 import asyncio
+import nest_asyncio
+nest_asyncio.apply() # patch asyncio to allow nested event loops
+import httpx
+import threading
 from urllib.parse import quote
 import threading
 from datetime import datetime, timedelta
@@ -29,10 +30,11 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys as SeleniumKeys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.common.exceptions import NoSuchElementException
+from selenium.common.exceptions import NoSuchElementException, NoAlertPresentException
 import pandas as pd
 import pyimgur
 import numpy as np
@@ -62,10 +64,10 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.9"
+WEBTOOLS_VERSION = "1.10"
 SERVED_FILES_PATH = os.path.expanduser('~/pastel_dupe_detection_service/img_server/')
 DEBUG_TIME_LIMIT_SECS = 900
-METADATA_DOWNLOAD_TIMEOUT_SECS = 90
+METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
 METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES = 5000
 MAX_SEARCH_RESULTS = 60
@@ -221,51 +223,64 @@ def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
     return input_text_data_compressed_b64
 
 
-def get_all_images_on_page_as_base64_encoded_strings(executor: concurrent.futures.ThreadPoolExecutor,
-                                                     html_of_page: str,
+async def get_all_images_on_page_as_base64_encoded_strings(get_task_id: int, html_of_page: str,
                                                      min_image_size_to_retrieve: int = METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES,
                                                      timeout_in_secs: float = METADATA_DOWNLOAD_TIMEOUT_SECS,
                                                      max_results_to_collect: int = MAX_SEARCH_RESULTS) -> Tuple[List[str], List[str]]:
     soup = BeautifulSoup(html_of_page, "lxml")
     img_elements = soup.find_all("img")
     
-    image_urls = [img.get("src") for img in img_elements if img.get("src") and "http" in img.get("src")]
+    image_urls = { img_src for img in img_elements if (img_src := img.get("src")) and img_src.startswith(("http://", "https://")) }
+    logger.info(f' [{get_task_id}] found {len(image_urls)} distinct img elements on the page')
+    if not image_urls:
+        return [], []
 
     list_of_base64_encoded_images = []
     list_of_corresponsing_image_urls = []
     
-    futures = {executor.submit(get_image_url_data, url, min_image_size_to_retrieve): url for url in image_urls}
-    
-    for future in concurrent.futures.as_completed(futures, timeout=timeout_in_secs):
-        if len(list_of_base64_encoded_images) >= max_results_to_collect:
-            logger.info(f'Reached max img elements to collect: {max_results_to_collect}. Stopping further retrieval.')
-            break
+    timer = Timer(start_timer=True)
+    httpx_timeout_config = httpx.Timeout((5.0, timeout_in_secs))  # connect=5.0, read=timeout_in_secs
+    total_image_count = len(image_urls)
+    is_max_results_reached = False
+    is_timeout = False
+    async with httpx.AsyncClient(timeout=httpx_timeout_config) as client:
+        chunk_size = 10
+        for i in range(0, len(image_urls), chunk_size):
+            if timer.elapsed_time >= timeout_in_secs:
+                logger.info(f' [{get_task_id}] timeout of {timeout_in_secs} seconds reached. Stopping image retrieval.')
+                is_timeout = True
+                break
+            image_urls_chunk = {image_urls.pop() for _ in range(min(chunk_size, len(image_urls)))}
+            
+            tasks = [get_image_url_data(client, url, min_image_size_to_retrieve) for url in image_urls_chunk]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        try:
-            base64_image, image_url = future.result()
-            if base64_image and image_url:
-                list_of_base64_encoded_images.append(base64_image)
-                list_of_corresponsing_image_urls.append(image_url)
-        except concurrent.futures.TimeoutError:
-            urls = []
-            for future, url in futures.items():
-                if not future.done():
-                    urls.append(url)
-                    future.cancel()
-            if len(urls) > 0:
-                urls_string = '\n'.join(urls)
-                logger.warning(f"Images ({len(urls)}) that could not be retrieved in {timeout_in_secs} seconds:\n{urls_string}")
-                    
-    # Cancel remaining futures if we reached the maximum number of results we want to collect                    
-    urls = [] 
-    for future, url in futures.items():
-        if not future.done() and not future.cancelled():
-            urls.append(url)
-            future.cancel()    
-    if len(urls) > 0:
-        urls_string = '\n'.join(urls)
-        logger.info(f"Images ({len(urls)}) retrieval was cancelled - max results {max_results_to_collect} reached:\n{urls_string}")
-    
+            for result in results:
+                if isinstance(result, Exception):
+                    continue
+                base64_img_data, image_url = result
+                if base64_img_data and image_url:
+                    list_of_base64_encoded_images.append(base64_img_data)
+                    list_of_corresponsing_image_urls.append(image_url)
+                    if len(list_of_base64_encoded_images) >= max_results_to_collect:
+                        is_max_results_reached = True
+                        logger.info(f' [{get_task_id}] max results {max_results_to_collect} reached')
+                        break
+            logger.info(f' [{get_task_id}] processed batch [{i + 1}-{i + len(image_urls_chunk)}/{total_image_count}] with {len(image_urls_chunk)} URLs.'
+                        f' Collected images: {len(list_of_base64_encoded_images)}')
+            if is_max_results_reached:
+                break
+            
+    if image_urls:  # URLs that were never processed
+        urls_string = '\n'.join(image_urls)
+        if is_max_results_reached:
+            reason = ' due to reaching max results'
+        elif is_timeout:
+            reason = f' due to timeout {timeout_in_secs} secs'
+        else:
+            reason = ''
+        logger.info(f' [{get_task_id}] images ({len(image_urls)}) were not processed{reason}:\n{urls_string}')
+            
     return list_of_base64_encoded_images, list_of_corresponsing_image_urls
 
 
@@ -326,7 +341,8 @@ class ChromeDriver:
         if chrome_user_data_dir is None or chrome_user_data_dir == '':
             raise ValueError('Chrome user data dir is empty')
         chrome_options = ChromeOptions()
-        chrome_options.add_argument("--headless=new")
+        if not CONFIG.debug_chrome_driver_headless_mode:
+            chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--window-size=1920,1200")
         chrome_options.add_argument("--disable-gpu")
@@ -373,10 +389,6 @@ class ChromeDriver:
             self.driver.set_script_timeout(30)
 
         self.img = img
-        try:
-            self.loop = asyncio.get_event_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()       
         logger.info(f'Initialized webtools v{WEBTOOLS_VERSION}')
 
 
@@ -390,44 +402,75 @@ class ChromeDriver:
                 self.driver.quit()
             except:
                 pass
-        
        
-    def get_additional_metadata_for_url(self, executor: concurrent.futures.ThreadPoolExecutor,
+    def driver_retrieve_url_data(self, id: int, query_url: str) -> str:
+        self.driver.get(query_url)
+        # wait for Ajax calls to complete
+        if self.is_jquery_loaded():
+            try:
+                logger.info(f' [{id}] waiting for jQuery Ajax calls to complete...')
+                WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script("return jQuery.active == 0"))
+                logger.info(f' [{id}] ...jQuery loaded')
+            except TimeoutException:
+                logger.info(f' [{id}] timed out waiting for jQuery Ajax calls to complete while getting metadata from URL [{query_url}]')
+        # check and dismiss any alert dialogs
+        try:
+            alert = self.driver.switch_to.alert
+            logger.info(f' [{id}] alert dialog found: {alert.text}')
+            alert.dismiss()
+        except NoAlertPresentException:
+            pass
+        logger.info(f' [{id}] waiting for the page to load...')
+        WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')
+        page_source_data = self.driver.page_source
+        logger.info(f' [{id}] ...page is loaded ({len(page_source_data)} bytes)!')
+        return page_source_data
+        
+
+    def get_additional_metadata_for_url(self, get_task_id: int,
                                         input_url: str, input_title_string: str, timeout_in_secs: float,
                                         max_results_to_collect: int = MAX_SEARCH_RESULTS):
         corresponding_description_string = ''
         list_of_date_strings_fixed = []
         list_of_base64_encoded_images = []
         list_of_corresponsing_image_urls = []
-        is_page_can_be_loaded = self.loop.run_until_complete(validate_url_load_time(input_url, timeout_in_secs / 2))
+        is_page_can_be_loaded = asyncio.run(validate_url_load_time(input_url, timeout_in_secs / 2))
+        is_new_tab_opened = False
         if is_page_can_be_loaded:
             try:
                 query = f"site:{input_url}"
                 encoded_query_url = f"https://www.google.com/search?q={quote(query)}"
                 self.driver.execute_script("window.open('', 'new_tab')")
                 self.driver.switch_to.window(self.driver.window_handles[-1])
-                self.driver.get(encoded_query_url)
-                google_search_page_html = self.driver.page_source
+                is_new_tab_opened = True
+                logger.info(f' [{get_task_id}] getting search metadata for [{input_url}]...')
+                google_search_page_html = self.driver_retrieve_url_data(get_task_id, encoded_query_url)
                 corresponding_description_string = extract_corresponding_description_string_from_input_title_string_func(input_title_string, google_search_page_html)
-                self.driver.get(input_url)
-                underlying_url_html = self.driver.page_source
+                logger.info(f' [{get_task_id}] getting metadata for [{input_url}]...')
+                time.sleep(random.uniform(1.0, 2.0))
+                underlying_url_html = self.driver_retrieve_url_data(get_task_id, input_url)
+                time.sleep(random.uniform(0.2, 1.0))
                 self.driver.close()
+                is_new_tab_opened = False
                 self.driver.switch_to.window(self.driver.window_handles[0])
                 if corresponding_description_string:
                     list_of_date_strings_fixed = extract_valid_dates_from_string_func(corresponding_description_string)
                 else:
                     list_of_date_strings_fixed = []
                 list_of_base64_encoded_images, list_of_corresponsing_image_urls = \
-                        get_all_images_on_page_as_base64_encoded_strings(executor, underlying_url_html, min_image_size_to_retrieve=METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES,
-                                                                         timeout_in_secs=timeout_in_secs, max_results_to_collect=max_results_to_collect)
+                        asyncio.run(get_all_images_on_page_as_base64_encoded_strings(get_task_id, underlying_url_html, min_image_size_to_retrieve=METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES,
+                                                                         timeout_in_secs=timeout_in_secs, max_results_to_collect=max_results_to_collect))
             except Exception as e:
-                logger.info(f'Could not retrieve additional metadata for [{input_url}]. {str(e)}')
+                logger.info(f' [{get_task_id}] could not retrieve additional metadata for [{input_url}]. {str(e)}')
+                if is_new_tab_opened:
+                    self.driver.close()
+                    self.driver.switch_to.window(self.driver.window_handles[0])
         else:
-            logger.info(f"Could not retrieve additional metadata for [{input_url}]. Page load time may exceed {timeout_in_secs} seconds.")
+            logger.info(f' [{get_task_id}] could not retrieve additional metadata for [{input_url}]. Page load time may exceed {timeout_in_secs} seconds.')
         return corresponding_description_string, list_of_date_strings_fixed, list_of_base64_encoded_images, list_of_corresponsing_image_urls
 
 
-    async def get_results_of_reverse_image_search(self):
+    def get_results_of_reverse_image_search(self):
         current_graph_json = None
         status_result__search = self.search_google_image_search_for_image()
         if status_result__search:
@@ -450,56 +493,50 @@ class ChromeDriver:
             index=pd.Index([], name='search_result_ranking'))
         
         timer = Timer(True)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=METADATA_DOWNLOAD_MAX_WORKERS) as executor:
-            images_hashes = set()
-            current_index = 0
-            for current_result in div_elements:
-                title_string, primary_url, img_src, resolution = get_fields_from_image_result(current_result)
-                # stop enumeration if we collected MAX_SEARCH_RESULTS images
-                image_count = len(combined_summary_df)
-                if image_count < MAX_SEARCH_RESULTS:
-                    logger.info(f'Collected {image_count} images. Getting additional metadata for URL [{primary_url}]...')
-                    future = executor.submit(self.get_additional_metadata_for_url, executor, primary_url, title_string,
-                                             METADATA_DOWNLOAD_TIMEOUT_SECS, MAX_SEARCH_RESULTS - image_count)
-                    try:
-                        description, list_of_date_strings_fixed, list_of_base64_encoded_images, list_of_corresponsing_image_urls = \
-                            future.result(timeout=METADATA_DOWNLOAD_TIMEOUT_SECS)
-                    except concurrent.futures.TimeoutError:
-                        if not future.done():
-                            logger.warning(f"Timeout elapsed ({METADATA_DOWNLOAD_TIMEOUT_SECS} secs) while getting additional metadata for URL: {primary_url}")
-                            future.cancel()
-                        continue
-                else:
-                    logger.info(f"Collected total {image_count} images in {timer.elapsed_time:.3f} secs")
-                    break
-                date_string = "|".join(list_of_date_strings_fixed)
-                # keep only images with correct base64 encoding and remove duplicates
-                need_to_save_img_src = True
-                img_src_resampled = resample_img_src(img_src, 1000)
-                for base64_encoded_image_data, image_url in zip(list_of_base64_encoded_images, list_of_corresponsing_image_urls):
-                    _, base64_data_only = extract_base64_data_from_image_url(base64_encoded_image_data)
-                    if not base64_data_only:
-                        continue
-                    image_base64_data_hash = get_sha3_256_from_data(base64_data_only)
-                    if image_base64_data_hash in images_hashes:
-                        continue
-                    images_hashes.add(image_base64_data_hash)
-                    # add one dataframe row for each retrieved image
-                    new_row = pd.DataFrame(
-                        [[
-                            title_string,
-                            description,
-                            primary_url,
-                            date_string,
-                            resolution,
-                            img_src_resampled if need_to_save_img_src else '',
-                            image_url,
-                            base64_data_only
-                        ]], columns=combined_summary_df.columns, index=[current_index])
-                    current_index += 1
-                    need_to_save_img_src = False
-                    combined_summary_df = pd.concat([combined_summary_df, new_row], ignore_index=False)
-            executor.shutdown(wait=False)
+        images_hashes = set()
+        current_index = 0
+        get_task_id: int = 0
+        for div_index, current_result in enumerate(div_elements):
+            title_string, primary_url, img_src, resolution = get_fields_from_image_result(current_result)
+            # stop enumeration if we collected MAX_SEARCH_RESULTS images
+            image_count = len(combined_summary_df)
+            get_task_id += 1
+            if image_count < MAX_SEARCH_RESULTS:
+                logger.info(f'Collected {image_count} images. Getting additional metadata [{div_index + 1}/{len(div_elements)}] for URL [{primary_url}]'
+                            f' (max items to collect: {MAX_SEARCH_RESULTS - image_count})...')
+                description, list_of_date_strings_fixed, list_of_base64_encoded_images, list_of_corresponsing_image_urls = \
+                    self.get_additional_metadata_for_url(get_task_id, primary_url, title_string,
+                                                         METADATA_DOWNLOAD_TIMEOUT_SECS, MAX_SEARCH_RESULTS - image_count)
+            else:
+                logger.info(f"Collected total {image_count} images in {timer.elapsed_time:.3f} secs")
+                break
+            date_string = "|".join(list_of_date_strings_fixed)
+            # keep only images with correct base64 encoding and remove duplicates
+            need_to_save_img_src = True
+            img_src_resampled = resample_img_src(img_src, 1000)
+            for base64_encoded_image_data, image_url in zip(list_of_base64_encoded_images, list_of_corresponsing_image_urls):
+                _, base64_data_only = extract_base64_data_from_image_url(base64_encoded_image_data)
+                if not base64_data_only:
+                    continue
+                image_base64_data_hash = get_sha3_256_from_data(base64_data_only)
+                if image_base64_data_hash in images_hashes:
+                    continue
+                images_hashes.add(image_base64_data_hash)
+                # add one dataframe row for each retrieved image
+                new_row = pd.DataFrame(
+                    [[
+                        title_string,
+                        description,
+                        primary_url,
+                        date_string,
+                        resolution,
+                        img_src_resampled if need_to_save_img_src else '',
+                        image_url,
+                        base64_data_only
+                    ]], columns=combined_summary_df.columns, index=[current_index])
+                current_index += 1
+                need_to_save_img_src = False
+                combined_summary_df = pd.concat([combined_summary_df, new_row], ignore_index=False)
         del div_elements
         gc.collect()
 
@@ -531,10 +568,6 @@ class ChromeDriver:
             filtered_combined_summary_df = combined_summary_df
             logger.warning('\n\n\n************WARNING: No valid images extracted!!************\n\n\n')
         return min_number_of_exact_matches_in_page, filtered_combined_summary_df, current_graph_json
-
-
-    def sync__get_results_of_reverse_image_search(self):
-        return self.loop.run_until_complete(self.get_results_of_reverse_image_search())
 
 
     def get_ip_func(self):
@@ -623,6 +656,13 @@ class ChromeDriver:
                     
             logger.info('Waiting for elements to be visible...')
             WebDriverWait(self.driver, 15).until(lambda wd: wd.find_element(By.XPATH, "//*[contains(text(), 'Visual matches')]"))
+            # check and dismiss any alert dialogs
+            try:
+                alert = self.driver.switch_to.alert
+                logger.info(f'Alert dialog found: {alert.text}')
+                alert.dismiss()
+            except NoAlertPresentException:
+                pass
             logger.info('Waiting for the page to load...')
             WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')            
             logger.info('...page is loaded!')
@@ -782,29 +822,43 @@ class ChromeDriver:
                         search_by_image_button[0].click()
                         logger.info('Clicked "Search by Image" button!')
                     time.sleep(random.uniform(1, 2))
-                    
-                    logger.info('Trying to click the "upload a file" button...')
-                    button_xpath = "//span[@role='button' and contains(text(), 'upload a file')]"
-                    list_of_buttons = self.driver.find_elements(By.XPATH, button_xpath)
-                    EC.element_to_be_clickable((By.XPATH, button_xpath))
-                    if len(list_of_buttons) > 0:
-                        logger.info(f'Found "upload an image" button [{len(list_of_buttons)}], now trying to click it...')
-                        for current_button in list_of_buttons:
-                            try:
-                                actions = ActionChains(self.driver)
-                                actions.move_to_element(current_button)
-                                actions.perform()
-                                current_button.click()
-                                logger.info('Clicked "upload an image" button!')
-                                time.sleep(random.uniform(0.2, 0.4))
-                                logger.info(f'Sending the following file path string to file upload selector control:\n{str(resized_image_save_path)}\n')
-                                file_selector = self.driver.find_element(By.XPATH, "//input[@type='file']")
-                                self.driver.execute_script("arguments[0].style.display = 'block';", file_selector)
-                                time.sleep(random.uniform(0.2, 0.4))
-                                file_selector.send_keys(str(resized_image_save_path))
-                                logger.info('Sent file path to file selector control!')
-                            except:
-                                pass
+
+                    try:
+                        file_selector = self.driver.find_element(By.XPATH, "//input[@type='file' and @name='encoded_image']")
+                        if not file_selector:
+                            raise Exception('Could not find file selector control!')
+                        logger.info('Found file selector control, now trying to send file path to it...')
+                        self.driver.execute_script("arguments[0].style.display = 'block';", file_selector)
+                        file_selector.send_keys(str(resized_image_save_path))
+                        time.sleep(random.uniform(0.2, 0.4))
+                        logger.info('...sent file path to file selector control!')
+                    except:                    
+                        logger.info('Trying to click the "upload a file" button...')
+                        button_xpath = "//span[@role='button' and contains(text(), 'upload a file')]"
+                        list_of_buttons = self.driver.find_elements(By.XPATH, button_xpath)
+                        EC.element_to_be_clickable((By.XPATH, button_xpath))
+                        if len(list_of_buttons) > 0:
+                            logger.info(f'Found "upload an image" button [{len(list_of_buttons)}], now trying to click it...')
+                            for current_button in list_of_buttons:
+                                try:
+                                    actions = ActionChains(self.driver)
+                                    actions.move_to_element(current_button)
+                                    actions.perform()
+                                    current_button.click()
+                                    logger.info('Clicked "upload an image" button!')
+                                    time.sleep(random.uniform(0.2, 0.4))
+                                    logger.info(f'Sending the following file path string to file upload selector control:\n{str(resized_image_save_path)}\n')
+                                    file_selector = self.driver.find_element(By.XPATH, "//input[@type='file']")
+                                    self.driver.execute_script("arguments[0].style.display = 'block';", file_selector)
+                                    time.sleep(random.uniform(0.2, 0.4))
+                                    file_selector.send_keys(str(resized_image_save_path))
+                                    logger.info('Sent file path to file selector control!')
+
+                                    # Send the Escape key to close the dialog
+                                    file_selector.send_keys(SeleniumKeys.ESCAPE)
+                                    logger.info('Sent Escape key to close the dialog!')                                
+                                except:
+                                    pass
                     time.sleep(random.uniform(2.5, 5))
                    
                     if not self.click_button_until_disappears("Find image source", "//button[.//div[text()='Find image source']]"):
