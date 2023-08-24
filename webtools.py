@@ -64,7 +64,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.10"
+WEBTOOLS_VERSION = "1.11"
 SERVED_FILES_PATH = os.path.expanduser('~/pastel_dupe_detection_service/img_server/')
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
@@ -274,7 +274,7 @@ async def get_all_images_on_page_as_base64_encoded_strings(get_task_id: int, htm
     if image_urls:  # URLs that were never processed
         urls_string = '\n'.join(image_urls)
         if is_max_results_reached:
-            reason = ' due to reaching max results'
+            reason = f' due to reaching max results ({max_results_to_collect})'
         elif is_timeout:
             reason = f' due to timeout {timeout_in_secs} secs'
         else:
@@ -653,9 +653,7 @@ class ChromeDriver:
                     logger.info('...jQuery loaded')
                 except TimeoutException:
                     logger.warning('Timed out waiting for jQuery Ajax calls to complete. Proceeding with parsing the page as it is.')
-                    
-            logger.info('Waiting for elements to be visible...')
-            WebDriverWait(self.driver, 15).until(lambda wd: wd.find_element(By.XPATH, "//*[contains(text(), 'Visual matches')]"))
+                   
             # check and dismiss any alert dialogs
             try:
                 alert = self.driver.switch_to.alert
@@ -663,9 +661,9 @@ class ChromeDriver:
                 alert.dismiss()
             except NoAlertPresentException:
                 pass
-            logger.info('Waiting for the page to load...')
-            WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')            
-            logger.info('...page is loaded!')
+            logger.info(f'Waiting for the search results page to load...')
+            WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')
+            logger.info(f'...page is loaded!')
             logger.info('Parsing page with BeautifulSoup...')
             soup = BeautifulSoup(self.driver.page_source, "lxml")    
             logger.info('Done parsing page!')
