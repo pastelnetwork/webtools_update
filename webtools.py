@@ -1,7 +1,7 @@
 # Copyright (c) 2021-2023 The Pastel Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://www.opensource.org/licenses/mit-license.php.
-from typing import Tuple, List
+from typing import Dict, Tuple, List, Optional
 import os
 import time
 import socket
@@ -9,7 +9,6 @@ import shutil
 import urllib.request
 import re
 import random
-import base64
 import json
 import gc
 import asyncio
@@ -22,7 +21,6 @@ import threading
 from datetime import datetime, timedelta
 import datefinder
 from html.parser import HTMLParser
-import zstandard as zstd
 from contextlib import contextmanager
 import _thread
 
@@ -43,10 +41,15 @@ from bs4 import BeautifulSoup
 from config import CONFIG
 from dd_logger import logger
 from utils import (
+    Timer,
+    NumpyEncoder,
     get_sha3_256_from_data,
     get_hash_sha3_256_from_file,
     is_in_debugger,
-    Timer,
+    compress_text_data_with_zstd_and_encode_as_base64,
+    get_free_port_from_range,
+    walk_child_processes,
+    kill_process,
 )
 from image_utils import (
     DDImage,
@@ -64,7 +67,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.11"
+WEBTOOLS_VERSION = "1.12"
 SERVED_FILES_PATH = os.path.expanduser('~/pastel_dupe_detection_service/img_server/')
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
@@ -73,6 +76,9 @@ METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES = 5000
 MAX_SEARCH_RESULTS = 60
 MAX_RESULTS_TO_RETURN = 15
 IMAGE_PROCESSING_BATCH_SIZE = 20
+CHROME_DEVTOOLS_PORT_RANGE_START = 9300
+CHROME_DEVTOOLS_PORT_RANGE_END = 9600
+GOOGLE_LENS_RESULT_PAGE_TIMEOUT = 35
 
 class TimeoutException(Exception):
     def __init__(self, msg=''):
@@ -170,7 +176,7 @@ def generate_rare_on_internet_graph_func(combined_summary_df, rare_on_internet__
                     logger.exception('Encountered error adding link to rare on internet graph structure')
     current_graph = {'nodes': nodes_list, 'links': links_list}
     #print('current_graph', current_graph)
-    current_graph_json = json.dumps(current_graph, indent=4, ensure_ascii=False)
+    current_graph_json = json.dumps(current_graph, indent=4, ensure_ascii=False, cls=NumpyEncoder)
     return current_graph_json
 
 
@@ -211,16 +217,8 @@ def generate_alt_rare_on_internet_graph_func(list_of_images_as_base64__filtered,
                 except BaseException as e:
                     logger.exception('Encountered error adding link to alternative rare on internet graph structure')
     current_graph = {'nodes': nodes_list, 'links': links_list}
-    current_graph_json = json.dumps(current_graph, indent=4, ensure_ascii=False)
+    current_graph_json = json.dumps(current_graph, indent=4, ensure_ascii=False, cls=NumpyEncoder)
     return current_graph_json
-
-
-def compress_text_data_with_zstd_and_encode_as_base64_func(input_text_data):
-    zstd_compression_level = 22  # Highest (best) compression level is 22
-    zstandard_compressor = zstd.ZstdCompressor(level=zstd_compression_level, write_content_size=True, write_checksum=True)
-    input_text_data_compressed = zstandard_compressor.compress(input_text_data.encode('utf-8'))
-    input_text_data_compressed_b64 = base64.b64encode(input_text_data_compressed).decode('utf-8')  
-    return input_text_data_compressed_b64
 
 
 async def get_all_images_on_page_as_base64_encoded_strings(get_task_id: int, html_of_page: str,
@@ -320,22 +318,35 @@ def get_fields_from_image_result(current_result):
     current_soup = BeautifulSoup(str(current_result), "lxml")
     title = current_soup.find("a")["aria-label"]
     original_url = current_soup.find("a")["href"]
+    
     current_img_element = current_soup.find("img", {"aria-hidden": "true"})
-    img_url = current_img_element["src"]
+    
+    if current_img_element:
+        img_url = current_img_element["src"]
+    else:
+        img_url = None
+        logger.info(f'No image element found in [{str(current_result)}]')
+        
     resolution_pattern = r"(\d+)x(\d+)"
     resolution_match = re.search(resolution_pattern, str(current_result))
     resolution = resolution_match.group(0) if resolution_match else None
+    
     img_src = ''
-    try:
-        img_src = sync__get_image_url_as_base64_string(img_url)
-    except:
-        print(f'Error retrieving image file from {img_url}')        
+    if img_url:
+        try:
+            img_src = sync__get_image_url_as_base64_string(img_url)
+        except:
+            logger.info(f'Could not retrieve image file from [{img_url}]')        
+            
     return title, original_url, img_src, resolution
 
 
 class ChromeDriver:
     
     def __init__(self, img: DDImage, chromedriver_path: str, chrome_user_data_dir: str):
+        self.devtools_port: int = get_free_port_from_range(CHROME_DEVTOOLS_PORT_RANGE_START, CHROME_DEVTOOLS_PORT_RANGE_END)
+        self.devtools_http_uri: str = f"http://localhost:{self.devtools_port}"
+        self.devtools_ws_uri: str = None
         if chromedriver_path is None or chromedriver_path == '':
             raise ValueError('ChromeDriver path is empty')
         if chrome_user_data_dir is None or chrome_user_data_dir == '':
@@ -353,6 +364,7 @@ class ChromeDriver:
         chrome_options.add_argument("--dns-prefetch-disable")
         chrome_options.add_argument("--ignore-certificate-errors")
         chrome_options.add_argument(f"--user-data-dir={chrome_user_data_dir}")
+        chrome_options.add_argument(f"--remote-debugging-port={self.devtools_port}")
         chrome_service_args = []
         if CONFIG.enable_chromedriver_logging:
             chrome_service_args.append("--verbose")
@@ -399,33 +411,132 @@ class ChromeDriver:
     def close(self):
         if self.driver:
             try:
+                logger.info(f'Closing ChromeDriver...')
                 self.driver.quit()
             except:
                 pass
        
-    def driver_retrieve_url_data(self, id: int, query_url: str) -> str:
-        self.driver.get(query_url)
+       
+    def wait_for_page_loaded(self, id: int = None, query_url: str = None):
         # wait for Ajax calls to complete
+        log_prefix = f' [{id}]' if id else ''
         if self.is_jquery_loaded():
             try:
-                logger.info(f' [{id}] waiting for jQuery Ajax calls to complete...')
+                logger.info(f'{log_prefix} waiting for jQuery Ajax calls to complete...')
                 WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script("return jQuery.active == 0"))
-                logger.info(f' [{id}] ...jQuery loaded')
+                logger.info(f'{log_prefix} ...jQuery loaded')
             except TimeoutException:
-                logger.info(f' [{id}] timed out waiting for jQuery Ajax calls to complete while getting metadata from URL [{query_url}]')
+                logger.info(f'{log_prefix} timed out (15 secs) waiting for jQuery Ajax calls to complete while getting metadata from [{query_url}]')
         # check and dismiss any alert dialogs
         try:
             alert = self.driver.switch_to.alert
-            logger.info(f' [{id}] alert dialog found: {alert.text}')
+            logger.info(f'{log_prefix} alert dialog found: {alert.text}')
             alert.dismiss()
         except NoAlertPresentException:
             pass
-        logger.info(f' [{id}] waiting for the page to load...')
-        WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')
+        logger.info(f'{log_prefix} waiting for the page to load...')
+        try:
+            WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')
+        except TimeoutException as exc:
+            logger.info(f'{log_prefix} timed out (15 secs) waiting for the page to load [{query_url}]')
+            raise exc
+
+       
+    def driver_retrieve_url_data(self, id: int, query_url: str) -> str:
+        self.driver.get(query_url)
+        self.wait_for_page_loaded(id, query_url)
         page_source_data = self.driver.page_source
         logger.info(f' [{id}] ...page is loaded ({len(page_source_data)} bytes)!')
         return page_source_data
+
+
+    def collect_renderer_ids(self) -> Dict[int, int]:
+        """
+        Collect all client IDs with their associated process IDs
+        Returns:
+            dict: {client_id: pid}
+        """
+        # Filter for renderer processes
+        filter_fn = lambda args: '--type=renderer' in args
         
+        client_id_to_pid = {}
+        def extract_renderer_id(pid, args):
+            # Extract the renderer client ID from the process arguments
+            match = re.search(r'--renderer-client-id=(\d+)', ' '.join(args))
+            if match:
+                client_id_to_pid[int(match.group(1))] = pid            
+                
+        walk_child_processes(self.driver.service.process.pid, filter_fn, extract_renderer_id)
+        return client_id_to_pid
+
+
+    def kill_new_renderer_processes(self, prev_client_id_to_pid: Dict[int, int]) -> bool:
+        is_renderer_processes_killed = False
+        try:
+            client_id_to_pid = self.collect_renderer_ids()
+            
+            # find new renderer processes
+            new_client_id_to_pid = {client_id: pid for client_id, pid in client_id_to_pid.items() if client_id not in prev_client_id_to_pid}
+            if len(new_client_id_to_pid) > 0:
+                logger.info(f'Found new chrome renderer processes: {new_client_id_to_pid}')
+            
+                # Kill the process associated with the highest renderer client ID
+                for client_id, pid in new_client_id_to_pid.items():
+                    kill_process(pid)
+                    logger.info(f'Killed chrome renderer process with client ID: {client_id}')
+                is_renderer_processes_killed = True
+            else:
+                logger.info(f'No new chrome renderer processes found')
+                
+        except Exception as exc:
+            logger.error(f'Error while killing the last renderer process: {str(exc)}')
+            
+        return is_renderer_processes_killed
+
+
+    def driver_safe_close_current_tab(self, prev_client_id_to_pid: Optional[Dict[int, int]]) -> bool:
+        """
+        Close the current tab in the browser.
+        Tries to close the tab gracefully, if it fails, kills new chrome renderer processes.
+        
+        Args:
+            prev_client_id_to_pid: dict of renderer client IDs to process IDs before the tab was opened.
+        
+        Returns:
+            True if the tab was closed gracefully, False otherwise.
+        """
+        is_closed = False
+        # try first to close tab gracefully
+        try:
+            self.driver.close()
+            is_closed = True
+        except Exception as exc:
+            logger.error(f"Failed to safely close the chrome tab. {str(exc)}")
+            pass
+        
+        if not is_closed:
+            try:
+                if self.kill_new_renderer_processes(prev_client_id_to_pid):
+                    # close current tab
+                    self.driver.close()
+                    is_closed = True
+            except Exception as exc:
+                logger.error(f"Failed to safely close the chrome tab. {str(exc)}")
+                pass
+        
+        return is_closed
+
+
+    def open_new_tab(self, get_task_id: int) -> bool:
+        try:
+            self.driver.switch_to.new_window('tab')
+            logger.info(f' [{get_task_id}] opened new Chrome tab...')
+            return True
+        except Exception as exc:
+            logger.error(f' [{get_task_id}] error opening new Chrome tab. {str(exc)}')
+            return False
+
+    VALIDATE_URL_LOAD_TIME: bool = False        
 
     def get_additional_metadata_for_url(self, get_task_id: int,
                                         input_url: str, input_title_string: str, timeout_in_secs: float,
@@ -434,15 +545,19 @@ class ChromeDriver:
         list_of_date_strings_fixed = []
         list_of_base64_encoded_images = []
         list_of_corresponsing_image_urls = []
-        is_page_can_be_loaded = asyncio.run(validate_url_load_time(input_url, timeout_in_secs / 2))
+        is_page_can_be_loaded = asyncio.run(validate_url_load_time(input_url, timeout_in_secs / 2)) if self.VALIDATE_URL_LOAD_TIME else True
+            
         is_new_tab_opened = False
         if is_page_can_be_loaded:
+            current_window_handle = self.driver.current_window_handle
+            client_id_to_pid = None
             try:
                 query = f"site:{input_url}"
                 encoded_query_url = f"https://www.google.com/search?q={quote(query)}"
-                self.driver.execute_script("window.open('', 'new_tab')")
-                self.driver.switch_to.window(self.driver.window_handles[-1])
-                is_new_tab_opened = True
+                client_id_to_pid = self.collect_renderer_ids()
+                is_new_tab_opened = self.open_new_tab(get_task_id)
+                if not is_new_tab_opened:
+                    return corresponding_description_string, list_of_date_strings_fixed, list_of_base64_encoded_images, list_of_corresponsing_image_urls
                 logger.info(f' [{get_task_id}] getting search metadata for [{input_url}]...')
                 google_search_page_html = self.driver_retrieve_url_data(get_task_id, encoded_query_url)
                 corresponding_description_string = extract_corresponding_description_string_from_input_title_string_func(input_title_string, google_search_page_html)
@@ -450,9 +565,11 @@ class ChromeDriver:
                 time.sleep(random.uniform(1.0, 2.0))
                 underlying_url_html = self.driver_retrieve_url_data(get_task_id, input_url)
                 time.sleep(random.uniform(0.2, 1.0))
-                self.driver.close()
+                if not self.driver_safe_close_current_tab(client_id_to_pid):
+                    self.open_new_tab(get_task_id) # to replace killed tab
+                else:
+                    self.driver.switch_to.window(current_window_handle)    
                 is_new_tab_opened = False
-                self.driver.switch_to.window(self.driver.window_handles[0])
                 if corresponding_description_string:
                     list_of_date_strings_fixed = extract_valid_dates_from_string_func(corresponding_description_string)
                 else:
@@ -463,8 +580,10 @@ class ChromeDriver:
             except Exception as e:
                 logger.info(f' [{get_task_id}] could not retrieve additional metadata for [{input_url}]. {str(e)}')
                 if is_new_tab_opened:
-                    self.driver.close()
-                    self.driver.switch_to.window(self.driver.window_handles[0])
+                    if not self.driver_safe_close_current_tab(client_id_to_pid):
+                        self.open_new_tab(get_task_id) # to replace killed tab
+                    else:
+                        self.driver.switch_to.window(current_window_handle)
         else:
             logger.info(f' [{get_task_id}] could not retrieve additional metadata for [{input_url}]. Page load time may exceed {timeout_in_secs} seconds.')
         return corresponding_description_string, list_of_date_strings_fixed, list_of_base64_encoded_images, list_of_corresponsing_image_urls
@@ -593,8 +712,8 @@ class ChromeDriver:
                     logger.info('Removing old thumbnail image file that is past the ' + str(limit_days) +
                                 '-day age limit: ' + current_file_path)
                     os.remove(current_file_path)
-        except:
-            logger.error('Error removing old thumbnail images...')
+        except Exception as exc:
+            logger.error(f'Error removing old thumbnail images. {str(exc)}')
 
 
     def remove_old_rare_on_internet_diagnostic_files_func(self, problem_files_path):
@@ -644,38 +763,39 @@ class ChromeDriver:
         alt_list_of_image_base64_hashes_filtered = []
         try:
             logger.info('Attempting to retrieve Google Lens results for image...')
-            status_result__google_lens, resized_image_save_path = self.search_google_lens_for_image_func()
-            # wait for Ajax calls to complete
-            if self.is_jquery_loaded():
-                try:
-                    logger.info('Waiting for jQuery Ajax calls to complete...')
-                    WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script("return jQuery.active == 0"))
-                    logger.info('...jQuery loaded')
-                except TimeoutException:
-                    logger.warning('Timed out waiting for jQuery Ajax calls to complete. Proceeding with parsing the page as it is.')
-                   
-            # check and dismiss any alert dialogs
-            try:
-                alert = self.driver.switch_to.alert
-                logger.info(f'Alert dialog found: {alert.text}')
-                alert.dismiss()
-            except NoAlertPresentException:
-                pass
-            logger.info(f'Waiting for the search results page to load...')
-            WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')
-            logger.info(f'...page is loaded!')
-            logger.info('Parsing page with BeautifulSoup...')
-            soup = BeautifulSoup(self.driver.page_source, "lxml")    
-            logger.info('Done parsing page!')
-            a_elements = [x for x in soup.find_all('a') if x.has_attr('aria-label') ]
+            _, _, a_elements_count_before_search = \
+                self.search_google_lens_for_image_func()
+            timer = Timer(True)
+            a_elements_count: int = None
+            id: int = 1
+            while timer.elapsed_time < GOOGLE_LENS_RESULT_PAGE_TIMEOUT:
+                sleep_time = random.uniform(0.5, 1.0)
+                logger.info(f' [{id}] sleep for {sleep_time:.3f} secs')
+                time.sleep(sleep_time)
+                self.wait_for_page_loaded(id, self.img.file_name)
+                page_source = self.driver.page_source
+                logger.info(f' [{id}] ...page is loaded ({len(page_source)} bytes)!')
+                logger.info(f' [{id}] parsing page with BeautifulSoup...')
+                soup = BeautifulSoup(page_source, "lxml")    
+                logger.info(f' [{id}] done parsing page!')
+                a_elements = [x for x in soup.find_all('a') if x.has_attr('aria-label') ]
+                a_elements_count = len(a_elements)
+                logger.info(f' [{id}] found {a_elements_count} <a> elements on the page')
+                if a_elements_count > a_elements_count_before_search:
+                    break
+                id += 1
             a_elements_filtered = [x for x in a_elements if ' data-thumbnail-url=' in str(x) and ' data-item-title="' in str(x)]
+            logger.info(f'Filtered {len(a_elements_filtered)} <a> elements with thumbnails on the page')
             a_elements_filtered_strings = [str(x) for x in a_elements_filtered]
+            logger.info(f'Extracted {len(a_elements_filtered_strings)} strings')
             list_of_alt_strings = [(x.split(' data-item-title="'))[1].split(' data-thumbnail-url=')[0] for x in a_elements_filtered_strings]
+            logger.info(f'Found {len(list_of_alt_strings)} alt strings')
             list_of_img_src_strings = [(x.split(' data-thumbnail-url='))[1].split(' jsaction="')[0] for x in a_elements_filtered_strings]
             list_of_img_src_strings = [x.replace('"','') for x in list_of_img_src_strings] #get rid of quote marks before and after the url
+            logger.info(f'Found {len(list_of_img_src_strings)} img_src strings')
             list_of_href_strings = [(x.split('" href="'))[1].split('" role="')[0] for x in a_elements_filtered_strings]
+            logger.info(f'Found {len(list_of_href_strings)} href strings')
             logger.info('Getting images and storing as base64 strings...')
-            logger.info('Done!')
             if len(list_of_img_src_strings) > MAX_SEARCH_RESULTS:
                 logger.info(f"Truncating image search results [{len(list_of_img_src_strings)}] -> [{MAX_SEARCH_RESULTS}]")
                 list_of_alt_strings = list_of_alt_strings[:MAX_SEARCH_RESULTS]                    
@@ -711,7 +831,7 @@ class ChromeDriver:
                 except BaseException as e:
                     logger.exception('Encountered problem filtering out dissimilar images from Google Lens data')
 
-            alternative_rare_on_internet_graph_json_compressed_b64 = compress_text_data_with_zstd_and_encode_as_base64_func(current_graph_json)
+            alternative_rare_on_internet_graph_json_compressed_b64 = compress_text_data_with_zstd_and_encode_as_base64(current_graph_json)
 
             dict_of_google_lens_results = {'list_of_image_src_strings': list_of_img_src_strings__filtered,
                                            'list_of_image_alt_strings': list_of_alt_strings__filtered,
@@ -719,7 +839,7 @@ class ChromeDriver:
                                            'list_of_sha3_256_hashes_of_images_as_base64': alt_list_of_image_base64_hashes_filtered,
                                            'list_of_href_strings': list_of_href_strings__filtered,
                                            'alternative_rare_on_internet_graph_json_compressed_b64': alternative_rare_on_internet_graph_json_compressed_b64}
-            dict_of_google_lens_results_as_json = json.dumps(dict_of_google_lens_results, indent=4, ensure_ascii=False)
+            dict_of_google_lens_results_as_json = json.dumps(dict_of_google_lens_results, indent=4, ensure_ascii=False, cls=NumpyEncoder)
             return dict_of_google_lens_results_as_json
         except BaseException as e:
             logger.exception('Problem getting Google Lens data')
@@ -896,9 +1016,10 @@ class ChromeDriver:
         return is_succeeded
 
 
-    def search_google_lens_for_image_func(self):
-        status_result = 0
-        with time_limit(40 if not is_in_debugger() else DEBUG_TIME_LIMIT_SECS, 'Search google lens for image.'):
+    def search_google_lens_for_image_func(self) -> Tuple[int, str, int]:
+        status_result: int = 0
+        a_elements_count: int = 0
+        with time_limit(40 if not is_in_debugger() else DEBUG_TIME_LIMIT_SECS, 'Search Google Lens for image.'):
             try:
                 resized_image_save_path = CONFIG.resized_images_top_save_path / self.img.file_name
                 self.resized_image_save_path = resized_image_save_path
@@ -982,14 +1103,22 @@ class ChromeDriver:
                             pass
                 time.sleep(random.uniform(0.5, 1.0))
                 choose_file_button_element = self.driver.find_element(By.XPATH, "//input[@type='file']")
-                if choose_file_button_element is not None:
+                if choose_file_button_element:
                     logger.info('Found file input element')
                 self.driver.execute_script("arguments[0].style.display = 'block';", choose_file_button_element)
+                # count "a" elements before we send image path
+                logger.info('Parsing original search page with BeautifulSoup...')
+                soup = BeautifulSoup(self.driver.page_source, "lxml")    
+                logger.info('Done parsing page!')
+                a_elements = [x for x in soup.find_all('a') if x.has_attr('aria-label') ]
+                a_elements_count = len(a_elements)
+                logger.info(f'Found {a_elements_count} <a> elements on the page')
+                
                 choose_file_button_element.send_keys(str(resized_image_save_path))
                 status_result = 1
             except BaseException as e:
                 logger.exception('Problem getting Google lens data')
-        return status_result, resized_image_save_path
+        return status_result, resized_image_save_path, a_elements_count
 
 
     def get_list_of_similar_images_func(self):
