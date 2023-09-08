@@ -38,7 +38,11 @@ import pyimgur
 import numpy as np
 from bs4 import BeautifulSoup
 
-from config import CONFIG
+from config import (
+    CONFIG,
+    CHROME_DEVTOOLS_PORT_RANGE_START,
+    CHROME_DEVTOOLS_PORT_RANGE_END,
+)
 from dd_logger import logger
 from utils import (
     Timer,
@@ -49,8 +53,11 @@ from utils import (
     compress_text_data_with_zstd_and_encode_as_base64,
     get_free_port_from_range,
     walk_child_processes,
+    cleanup_old_files,
     kill_process,
+    is_port_in_use,
 )
+from dupe_detection_params import DupeDetectionTaskParams
 from image_utils import (
     DDImage,
     ImageDataPreProcessedBase64String,
@@ -67,8 +74,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.12"
-SERVED_FILES_PATH = os.path.expanduser('~/pastel_dupe_detection_service/img_server/')
+WEBTOOLS_VERSION = "1.13"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
@@ -76,8 +82,6 @@ METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES = 5000
 MAX_SEARCH_RESULTS = 60
 MAX_RESULTS_TO_RETURN = 15
 IMAGE_PROCESSING_BATCH_SIZE = 20
-CHROME_DEVTOOLS_PORT_RANGE_START = 9300
-CHROME_DEVTOOLS_PORT_RANGE_END = 9600
 GOOGLE_LENS_RESULT_PAGE_TIMEOUT = 35
 
 class TimeoutException(Exception):
@@ -315,21 +319,27 @@ def extract_valid_dates_from_string_func(input_string):
 
 
 def get_fields_from_image_result(current_result):
-    current_soup = BeautifulSoup(str(current_result), "lxml")
-    title = current_soup.find("a")["aria-label"]
-    original_url = current_soup.find("a")["href"]
-    
-    current_img_element = current_soup.find("img", {"aria-hidden": "true"})
-    
-    if current_img_element:
-        img_url = current_img_element["src"]
-    else:
-        img_url = None
-        logger.info(f'No image element found in [{str(current_result)}]')
+    title = ''
+    original_url = ''
+    img_url = None
+    resolution = ''
+    try:
+        current_soup = BeautifulSoup(str(current_result), "lxml")
+        label_element = current_soup.find("a")
+        if label_element:
+            title = label_element["aria-label"]
+            original_url = label_element["href"]
         
-    resolution_pattern = r"(\d+)x(\d+)"
-    resolution_match = re.search(resolution_pattern, str(current_result))
-    resolution = resolution_match.group(0) if resolution_match else None
+        current_img_element = current_soup.find("img", {"aria-hidden": "true"})
+        if current_img_element:
+            img_url = current_img_element["src"]
+            
+        resolution_pattern = r"(\d+)x(\d+)"
+        resolution_match = re.search(resolution_pattern, str(current_result))
+        if resolution_match:
+            resolution = resolution_match.group(0)
+    except Exception as exc:
+        logger.info(f"Error parsing image result: {str(exc)}")
     
     img_src = ''
     if img_url:
@@ -343,13 +353,16 @@ def get_fields_from_image_result(current_result):
 
 class ChromeDriver:
     
-    def __init__(self, img: DDImage, chromedriver_path: str, chrome_user_data_dir: str):
-        self.devtools_port: int = get_free_port_from_range(CHROME_DEVTOOLS_PORT_RANGE_START, CHROME_DEVTOOLS_PORT_RANGE_END)
+    def __init__(self, img: DDImage, dd_params: DupeDetectionTaskParams):
+        self.devtools_port = dd_params.chrome_devtools_port
+        if is_port_in_use(self.devtools_port):
+            logger.error(f'Chrome DevTools port {self.devtools_port} is already in use')
+            self.devtools_port = get_free_port_from_range(CHROME_DEVTOOLS_PORT_RANGE_START + 100, CHROME_DEVTOOLS_PORT_RANGE_END)
         self.devtools_http_uri: str = f"http://localhost:{self.devtools_port}"
         self.devtools_ws_uri: str = None
-        if chromedriver_path is None or chromedriver_path == '':
+        if dd_params.chromedriver_path is None or dd_params.chromedriver_path == '':
             raise ValueError('ChromeDriver path is empty')
-        if chrome_user_data_dir is None or chrome_user_data_dir == '':
+        if dd_params.chrome_user_data_dir is None or dd_params.chrome_user_data_dir == '':
             raise ValueError('Chrome user data dir is empty')
         chrome_options = ChromeOptions()
         if not CONFIG.debug_chrome_driver_headless_mode:
@@ -363,7 +376,7 @@ class ChromeDriver:
         chrome_options.add_argument("--disable-extensions")
         chrome_options.add_argument("--dns-prefetch-disable")
         chrome_options.add_argument("--ignore-certificate-errors")
-        chrome_options.add_argument(f"--user-data-dir={chrome_user_data_dir}")
+        chrome_options.add_argument(f"--user-data-dir={dd_params.chrome_user_data_dir}")
         chrome_options.add_argument(f"--remote-debugging-port={self.devtools_port}")
         chrome_service_args = []
         if CONFIG.enable_chromedriver_logging:
@@ -385,7 +398,7 @@ class ChromeDriver:
         }
         chrome_options.add_experimental_option("prefs", prefs)
         self.resized_image_save_path = None
-        chrome_service = ChromeService(executable_path=chromedriver_path, service_args=chrome_service_args)
+        chrome_service = ChromeService(executable_path=dd_params.chromedriver_path, service_args=chrome_service_args)
         for i in range(3):
             try:
                 self.driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
@@ -562,9 +575,9 @@ class ChromeDriver:
                 google_search_page_html = self.driver_retrieve_url_data(get_task_id, encoded_query_url)
                 corresponding_description_string = extract_corresponding_description_string_from_input_title_string_func(input_title_string, google_search_page_html)
                 logger.info(f' [{get_task_id}] getting metadata for [{input_url}]...')
-                time.sleep(random.uniform(1.0, 2.0))
+                time.sleep(random.uniform(1.5, 2.5))
                 underlying_url_html = self.driver_retrieve_url_data(get_task_id, input_url)
-                time.sleep(random.uniform(0.2, 1.0))
+                time.sleep(random.uniform(1.5, 2.5))
                 if not self.driver_safe_close_current_tab(client_id_to_pid):
                     self.open_new_tab(get_task_id) # to replace killed tab
                 else:
@@ -701,45 +714,16 @@ class ChromeDriver:
         return IP
 
 
-    def remove_old_served_image_files_func(self):
-        limit_days = 3
-        threshold = time.time() - limit_days * 86400
-        list_of_file_paths = os.listdir(SERVED_FILES_PATH)
-        try:
-            for current_file_path in list_of_file_paths:
-                creation_time = os.stat(os.path.join(SERVED_FILES_PATH, current_file_path)).st_ctime
-                if creation_time < threshold:
-                    logger.info('Removing old thumbnail image file that is past the ' + str(limit_days) +
-                                '-day age limit: ' + current_file_path)
-                    os.remove(current_file_path)
-        except Exception as exc:
-            logger.error(f'Error removing old thumbnail images. {str(exc)}')
-
-
-    def remove_old_rare_on_internet_diagnostic_files_func(self, problem_files_path):
-        limit_days = 3
-        threshold = time.time() - limit_days * 86400
-        list_of_file_paths = os.listdir(problem_files_path)
-        try:
-            for current_file_path in list_of_file_paths:
-                creation_time = os.stat(os.path.join(problem_files_path, current_file_path)).st_ctime
-                if creation_time < threshold:
-                    logger.info('Removing old Rare on the Internet diagnostic html file that is past the ' + str(limit_days) +
-                                '-day age limit: ' + current_file_path)
-                    os.remove(current_file_path)
-        except:
-            logger.error('Error removing old Rare on the Internet diagnostic html file...')
-
-
     def prepare_image_for_serving_func(self):
         sha3_256_hash_of_image_file = get_hash_sha3_256_from_file(self.resized_image_save_path)
         image_format = self.resized_image_save_path.suffix[1:]
-        destination_path = SERVED_FILES_PATH + sha3_256_hash_of_image_file[0:10] + '.' + image_format[0:3]
+        destination_path = CONFIG.served_files_path / sha3_256_hash_of_image_file[0:10] + '.' + image_format[0:3]
         shutil.copy(self.resized_image_save_path, destination_path)
-        logger.info(f'Copied file {str(self.resized_image_save_path)} to path {destination_path}')
+        logger.info(f'Copied file {str(self.resized_image_save_path)} to path {str(destination_path)}')
         destination_url = 'http://' + self.get_ip_func() + '/' + sha3_256_hash_of_image_file[0:10] + '.' + image_format
-        self.remove_old_served_image_files_func()
+        cleanup_old_files(CONFIG.served_files_path, "thumbnail image", None, None, 3)
         return destination_path, destination_url
+
 
     def is_jquery_loaded(self):
         """
@@ -931,13 +915,13 @@ class ChromeDriver:
                     except:
                         pass
                     logger.info('Trying to select "Search by Image" button...')
-                    search_by_image_button = self.driver.find_elements(By.CSS_SELECTOR, "[aria-label='Search by image']")
+                    wait = WebDriverWait(self.driver, 10) # wait up to 10 seconds
+                    search_by_image_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "[aria-label='Search by image']")))
                     actions = ActionChains(self.driver)
-                    if len(search_by_image_button):
+                    if search_by_image_button:
                         logger.info('Found "Search by Image" button, now trying to click it...')
-                        actions.move_to_element(search_by_image_button[0])
-                        actions.perform()
-                        search_by_image_button[0].click()
+                        actions.move_to_element(search_by_image_button).perform()
+                        search_by_image_button.click()
                         logger.info('Clicked "Search by Image" button!')
                     time.sleep(random.uniform(1, 2))
 
@@ -983,7 +967,7 @@ class ChromeDriver:
                         raise Exception('Could not click on the "Find image source" button')
                     time.sleep(random.uniform(2.0, 3.0))
                     is_succeeded = True
-                except BaseException as e:
+                except BaseException as exc:
                     logger.exception('Problem using Selenium driver, now trying with local HTTP server')
                     try:
                         destination_path, destination_url = self.prepare_image_for_serving_func()
@@ -1011,7 +995,7 @@ class ChromeDriver:
                         google_reverse_image_search_base_url = 'https://www.google.com/searchbyimage?q=&image_url=' + uploaded_image.link
                         self.driver.get(google_reverse_image_search_base_url)
                         is_succeeded = True
-        except BaseException as e:
+        except BaseException:
             logger.exception('Encountered Error with "Rare on Internet" check')
         return is_succeeded
 
