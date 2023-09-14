@@ -74,14 +74,13 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.13"
+WEBTOOLS_VERSION = "1.14"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
 METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES = 5000
 MAX_SEARCH_RESULTS = 60
 MAX_RESULTS_TO_RETURN = 15
-IMAGE_PROCESSING_BATCH_SIZE = 20
 GOOGLE_LENS_RESULT_PAGE_TIMEOUT = 35
 
 class TimeoutException(Exception):
@@ -676,7 +675,7 @@ class ChromeDriver:
             combined_list_of_base64_encoded_images = combined_summary_df['misc_related_image_as_b64_string'].values.tolist()
             search_images = [ImageDataPreProcessedBase64String(base64_encoded_data) for base64_encoded_data in combined_list_of_base64_encoded_images]
             indices_to_keep, _, rare_on_internet__similarity_df, rare_on_internet__adjacency_df = \
-                filter_out_dissimilar_images_batch('google image search results', self.resized_image_save_path, search_images, IMAGE_PROCESSING_BATCH_SIZE)
+                filter_out_dissimilar_images_batch('google image search results', self.resized_image_save_path, search_images, CONFIG.image_processing_batch_size)
             if len(indices_to_keep) < MAX_RESULTS_TO_RETURN:
                 logger.info(f'Keeping {len(indices_to_keep)} of {len(search_images)} '
                             'google reverse image search images that are above the similarity score threshold.')
@@ -793,7 +792,7 @@ class ChromeDriver:
                     list_of_images = [ImageDataPreProcessedUrl(image_src_url) for image_src_url in list_of_img_src_strings]
                     list_of_image_indices_to_keep, alt_list_of_image_base64_hashes_filtered, \
                     alt_rare_on_internet__similarity_df, alt_rare_on_internet__adjacency_df = \
-                        filter_out_dissimilar_images_batch('google lens results', self.resized_image_save_path, list_of_images, IMAGE_PROCESSING_BATCH_SIZE)
+                        filter_out_dissimilar_images_batch('google lens results', self.resized_image_save_path, list_of_images, CONFIG.image_processing_batch_size)
                     logger.info(f'Keeping {len(list_of_image_indices_to_keep)} of {len(list_of_images)} google lens images that are above the similarity score threshold.')
                     if len(list_of_image_indices_to_keep) > 0:
                         list_of_img_src_strings__filtered = np.array(list_of_img_src_strings)[list_of_image_indices_to_keep].tolist()
