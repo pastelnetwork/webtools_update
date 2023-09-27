@@ -74,10 +74,11 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.15"
+WEBTOOLS_VERSION = "1.16"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
+METADATA_URL_LOAD_TIMEOUT_SECS = 15
 METADATA_MIN_IMAGE_SIZE_TO_RETRIEVE_BYTES = 5000
 MAX_SEARCH_RESULTS = 40
 MAX_RESULTS_TO_RETURN = 15
@@ -429,16 +430,16 @@ class ChromeDriver:
                 pass
        
        
-    def wait_for_page_loaded(self, id: int = None, query_url: str = None):
+    def wait_for_page_loaded(self, id: int = None, query_url: str = None, timeout_in_secs: int = 10):
         # wait for Ajax calls to complete
         log_prefix = f' [{id}]' if id else ''
         if self.is_jquery_loaded():
             try:
                 logger.info(f'{log_prefix} waiting for jQuery Ajax calls to complete...')
-                WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script("return jQuery.active == 0"))
+                WebDriverWait(self.driver, timeout_in_secs).until(lambda wd: wd.execute_script("return jQuery.active == 0"))
                 logger.info(f'{log_prefix} ...jQuery loaded')
             except TimeoutException:
-                logger.info(f'{log_prefix} timed out (15 secs) waiting for jQuery Ajax calls to complete while getting metadata from [{query_url}]')
+                logger.info(f'{log_prefix} timed out ({timeout_in_secs} secs) waiting for jQuery Ajax calls to complete while getting metadata from [{query_url}]')
         # check and dismiss any alert dialogs
         try:
             alert = self.driver.switch_to.alert
@@ -448,15 +449,29 @@ class ChromeDriver:
             pass
         logger.info(f'{log_prefix} waiting for the page to load...')
         try:
-            WebDriverWait(self.driver, 15).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')
+            WebDriverWait(self.driver, timeout_in_secs).until(lambda wd: wd.execute_script('return document.readyState') == 'complete')
         except TimeoutException as exc:
-            logger.info(f'{log_prefix} timed out (15 secs) waiting for the page to load [{query_url}]')
+            logger.info(f'{log_prefix} timed out ({timeout_in_secs} secs) waiting for the page to load [{query_url}]')
             raise exc
 
+
+    def driver_get_with_timeout(self, query_url, timeout_in_secs: int = 10):
+        # Define a function that runs `driver.get` in a thread.
+        def get_url_in_thread():
+            self.driver.get(query_url)
+
+        thread = threading.Thread(target=get_url_in_thread)
+        thread.start()
+        thread.join(timeout=timeout_in_secs)
+
+        # If the thread is still active after timeout, raise an exception.
+        if thread.is_alive():
+            raise TimeoutException(f"Timeout ({timeout_in_secs} secs) exceeded for URL [{query_url}]")
+        
        
-    def driver_retrieve_url_data(self, id: int, query_url: str) -> str:
-        self.driver.get(query_url)
-        self.wait_for_page_loaded(id, query_url)
+    def driver_retrieve_url_data(self, id: int, query_url: str, timeout_in_secs: int = 10) -> str:
+        self.driver_get_with_timeout(query_url, timeout_in_secs)
+        self.wait_for_page_loaded(id, query_url, timeout_in_secs)
         page_source_data = self.driver.page_source
         logger.info(f' [{id}] ...page is loaded ({len(page_source_data)} bytes)!')
         return page_source_data
@@ -571,11 +586,11 @@ class ChromeDriver:
                 if not is_new_tab_opened:
                     return corresponding_description_string, list_of_date_strings_fixed, list_of_base64_encoded_images, list_of_corresponsing_image_urls
                 logger.info(f' [{get_task_id}] getting search metadata for [{input_url}]...')
-                google_search_page_html = self.driver_retrieve_url_data(get_task_id, encoded_query_url)
+                google_search_page_html = self.driver_retrieve_url_data(get_task_id, encoded_query_url, METADATA_URL_LOAD_TIMEOUT_SECS)
                 corresponding_description_string = extract_corresponding_description_string_from_input_title_string_func(input_title_string, google_search_page_html)
                 logger.info(f' [{get_task_id}] getting metadata for [{input_url}]...')
                 time.sleep(random.uniform(1.5, 2.5))
-                underlying_url_html = self.driver_retrieve_url_data(get_task_id, input_url)
+                underlying_url_html = self.driver_retrieve_url_data(get_task_id, input_url, METADATA_URL_LOAD_TIMEOUT_SECS)
                 time.sleep(random.uniform(1.5, 2.5))
                 if not self.driver_safe_close_current_tab(client_id_to_pid):
                     self.open_new_tab(get_task_id) # to replace killed tab
@@ -688,10 +703,11 @@ class ChromeDriver:
                 rare_on_internet__adjacency_df = rare_on_internet__adjacency_df.head(MAX_RESULTS_TO_RETURN)
                 
             filtered_combined_summary_df = combined_summary_df.loc[indices_to_keep]
+            # reset index to be sequential 
+            filtered_combined_summary_df.reset_index(drop=True, inplace=True)
             # replace image data with resampled from search_images
             for i, index_to_keep in enumerate(indices_to_keep):
                 filtered_combined_summary_df.loc[i, 'misc_related_image_as_b64_string'] = search_images[index_to_keep].get_base64_encoded_data()
-            filtered_combined_summary_df.reset_index(drop=True, inplace=True)
             del combined_summary_df
             gc.collect()
             current_graph_json = generate_rare_on_internet_graph_func(filtered_combined_summary_df, rare_on_internet__similarity_df, rare_on_internet__adjacency_df)
@@ -975,7 +991,7 @@ class ChromeDriver:
                         if img_check:
                             logger.info(f'File {destination_path} is a valid image')
                             hosted_image_url_response_code = urllib.request.urlopen(destination_url).getcode()
-                            if hosted_image_url_response_code == 200:
+                            if hosted_image_url_response_code == httpx.codes.OK:
                                 google_reverse_image_search_base_url = 'https://www.google.com/searchbyimage?q=&image_url=' + destination_url
                                 self.driver.get(google_reverse_image_search_base_url)
                                 is_succeeded = True
