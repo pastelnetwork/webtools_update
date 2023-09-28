@@ -74,7 +74,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.16"
+WEBTOOLS_VERSION = "1.17"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
@@ -318,18 +318,26 @@ def extract_valid_dates_from_string_func(input_string):
     return list_of_date_strings_fixed
 
 
-def get_fields_from_image_result(current_result):
-    title = ''
-    original_url = ''
-    img_url = None
+def get_fields_from_image_search_result(current_result):
+    title = None
+    original_url = None
     resolution = ''
     try:
         current_soup = BeautifulSoup(str(current_result), "lxml")
-        label_element = current_soup.find("a")
+        label_element = current_soup.find("a", {"aria-label": True, "href": True})
         if label_element:
             title = label_element["aria-label"]
             original_url = label_element["href"]
-        
+            if title == '':
+                div_subitem = label_element.find("div", {"data-item-title": True})
+                if div_subitem:
+                    title = div_subitem["data-item-title"]
+                    if original_url is None or original_url == '':
+                        original_url = div_subitem.get("data-action-url")
+                        
+        if original_url is None or original_url == '':
+            original_url = current_soup.get("data-action-url")
+
         current_img_element = current_soup.find("img", {"aria-hidden": "true"})
         if current_img_element:
             img_url = current_img_element["src"]
@@ -347,6 +355,10 @@ def get_fields_from_image_result(current_result):
             img_src = sync__get_image_url_as_base64_string(img_url)
         except:
             logger.info(f'Could not retrieve image file from [{img_url}]')        
+    if not title:
+        title = ''
+    if not original_url:
+        original_url = ''
             
     return title, original_url, img_src, resolution
 
@@ -625,7 +637,12 @@ class ChromeDriver:
             logger.info(f'\nThere was a problem with the reverse image search!')
         soup = BeautifulSoup(self.driver.page_source, "lxml")    
         logger.info('Done parsing reverse image search page!')
-        div_elements = [x for x in soup.find_all('div') if '.gstatic.com' in str(x) and 'role="menuitem"' in str(x) and len(str(x)) < 45000]
+
+        div_elements = [x for x in soup.find_all('div', attrs={"data-action-url": True})
+                        if (lambda elem_str: '.gstatic.com' in elem_str and len(elem_str) < 45000)(str(x))
+                        and x.find('a', {"aria-label": True, "role": "link"})  # The div should contain an 'a' tag with an href attribute.
+                        and "Search" not in x.get_text()  # The div shouldn't contain the text "Search".
+                        ]
         min_number_of_exact_matches_in_page = len(div_elements)
         combined_summary_df = pd.DataFrame(
             columns=['title',
@@ -643,7 +660,7 @@ class ChromeDriver:
         current_index = 0
         get_task_id: int = 0
         for div_index, current_result in enumerate(div_elements):
-            title_string, primary_url, img_src, resolution = get_fields_from_image_result(current_result)
+            title_string, primary_url, img_src, resolution = get_fields_from_image_search_result(current_result)
             # stop enumeration if we collected MAX_SEARCH_RESULTS images
             image_count = len(combined_summary_df)
             get_task_id += 1
