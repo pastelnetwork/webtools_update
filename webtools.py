@@ -57,7 +57,10 @@ from utils import (
     kill_process,
     is_port_in_use,
 )
-from dupe_detection_params import DupeDetectionTaskParams
+from dupe_detection_params import (
+    DupeDetectionTaskParams,
+    TaskCancelledError,
+)
 from image_utils import (
     DDImage,
     ImageDataPreProcessedBase64String,
@@ -74,7 +77,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.17"
+WEBTOOLS_VERSION = "1.18"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
@@ -366,6 +369,7 @@ def get_fields_from_image_search_result(current_result):
 class ChromeDriver:
     
     def __init__(self, img: DDImage, dd_params: DupeDetectionTaskParams):
+        self.dd_params = dd_params
         self.devtools_port = dd_params.chrome_devtools_port
         if is_port_in_use(self.devtools_port):
             logger.error(f'Chrome DevTools port {self.devtools_port} is already in use')
@@ -431,6 +435,11 @@ class ChromeDriver:
 
     def __del__(self):
         self.close()        
+
+        
+    def check_task_cancelled(self):
+        if self.dd_params.is_task_cancelled():
+            raise TaskCancelledError(f"Dupe Detection Task [{self.dd_params.task_id}] cancelled.")
 
         
     def close(self):
@@ -707,7 +716,9 @@ class ChromeDriver:
             combined_list_of_base64_encoded_images = combined_summary_df['misc_related_image_as_b64_string'].values.tolist()
             search_images = [ImageDataPreProcessedBase64String(base64_encoded_data) for base64_encoded_data in combined_list_of_base64_encoded_images]
             indices_to_keep, _, rare_on_internet__similarity_df, rare_on_internet__adjacency_df = \
-                filter_out_dissimilar_images_batch('google image search results', self.resized_image_save_path, search_images, CONFIG.image_processing_batch_size)
+                filter_out_dissimilar_images_batch('google image search results', self.resized_image_save_path, search_images, 
+                                                   self.dd_params.is_task_cancelled, CONFIG.image_processing_batch_size)
+            self.check_task_cancelled()
             if len(indices_to_keep) < MAX_RESULTS_TO_RETURN:
                 logger.info(f'Keeping {len(indices_to_keep)} of {len(search_images)} '
                             'google reverse image search images that are above the similarity score threshold.')
@@ -825,7 +836,9 @@ class ChromeDriver:
                     list_of_images = [ImageDataPreProcessedUrl(image_src_url) for image_src_url in list_of_img_src_strings]
                     list_of_image_indices_to_keep, alt_list_of_image_base64_hashes_filtered, \
                     alt_rare_on_internet__similarity_df, alt_rare_on_internet__adjacency_df = \
-                        filter_out_dissimilar_images_batch('google lens results', self.resized_image_save_path, list_of_images, CONFIG.image_processing_batch_size)
+                        filter_out_dissimilar_images_batch('google lens results', self.resized_image_save_path, list_of_images,
+                                                           self.dd_params.is_task_cancelled, CONFIG.image_processing_batch_size)
+                    self.check_task_cancelled()
                     logger.info(f'Keeping {len(list_of_image_indices_to_keep)} of {len(list_of_images)} google lens images that are above the similarity score threshold.')
                     if len(list_of_image_indices_to_keep) > 0:
                         list_of_img_src_strings__filtered = np.array(list_of_img_src_strings)[list_of_image_indices_to_keep].tolist()
