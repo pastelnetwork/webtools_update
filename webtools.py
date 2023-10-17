@@ -32,7 +32,11 @@ from selenium.webdriver.common.keys import Keys as SeleniumKeys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.common.exceptions import NoSuchElementException, NoAlertPresentException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    NoAlertPresentException,
+    MoveTargetOutOfBoundsException,
+)
 import pandas as pd
 import pyimgur
 import numpy as np
@@ -77,7 +81,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.19"
+WEBTOOLS_VERSION = "1.20"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
@@ -390,10 +394,13 @@ class ChromeDriver:
         chrome_options.add_argument("--start-maximized")
         chrome_options.add_argument("--disable-backgrounding-occluded-windows")
         chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-notifications")
+        chrome_options.add_argument("--disable-subframe-process-reuse")
         chrome_options.add_argument("--dns-prefetch-disable")
         chrome_options.add_argument("--ignore-certificate-errors")
         chrome_options.add_argument(f"--user-data-dir={dd_params.chrome_user_data_dir}")
         chrome_options.add_argument(f"--remote-debugging-port={self.devtools_port}")
+        chrome_options.add_argument("--site-per-process")
         chrome_service_args = []
         if CONFIG.enable_chromedriver_logging:
             chrome_service_args.append("--verbose")
@@ -476,10 +483,11 @@ class ChromeDriver:
             raise exc
 
 
-    def driver_get_with_timeout(self, query_url, timeout_in_secs: int = 10):
+    def driver_get_with_timeout(self, id: int, query_url: str, timeout_in_secs: int = 10):
         # Define a function that runs `driver.get` in a thread.
         def get_url_in_thread():
             self.driver.get(query_url)
+            self.wait_for_page_loaded(id, query_url, timeout_in_secs)
 
         thread = threading.Thread(target=get_url_in_thread)
         thread.start()
@@ -491,8 +499,7 @@ class ChromeDriver:
         
        
     def driver_retrieve_url_data(self, id: int, query_url: str, timeout_in_secs: int = 10) -> str:
-        self.driver_get_with_timeout(query_url, timeout_in_secs)
-        self.wait_for_page_loaded(id, query_url, timeout_in_secs)
+        self.driver_get_with_timeout(id, query_url, timeout_in_secs)
         page_source_data = self.driver.page_source
         logger.info(f' [{id}] ...page is loaded ({len(page_source_data)} bytes)!')
         return page_source_data
@@ -1022,6 +1029,100 @@ class ChromeDriver:
                                     pass
                     time.sleep(random.uniform(2.5, 5))
                    
+                    def find_element_safe(by, value):
+                        try:
+                            return self.driver.find_element(by, value)
+                        except NoSuchElementException:
+                            return None
+                        
+                    def adjust_slider(slider_name: str, slider_handle, desired_value: int, direction_multiplier: int, is_horizontal: bool):
+                        if not slider_handle:
+                            return
+                        
+                        max_iterations = 30
+                        # Get the initial value of the slider
+                        initial_value = int(slider_handle.get_attribute("value"))
+                        new_value = initial_value
+                        
+                        # Only adjust if necessary
+                        if (direction_multiplier == 1 and initial_value < desired_value) or (direction_multiplier == -1 and initial_value > desired_value):
+                            logger.info(f"Adjusting {slider_name} slider from {initial_value} to {desired_value}")
+                            offset = 10 # initial offset
+                            total_offset = 0 # total offset applied
+                            change = 0
+                            iterations = 0 # safety check - counter for number of iterations
+                            
+                            while change == 0 and iterations < max_iterations:
+                                try:                            
+                                    # Try a small move to see how much the value changes
+                                    actions.move_to_element(slider_handle).click_and_hold().move_by_offset(
+                                        offset * direction_multiplier if is_horizontal else 0,
+                                        -offset * direction_multiplier if not is_horizontal else 0).release().perform()
+                            
+                                    # Get the changed value
+                                    new_value = int(slider_handle.get_attribute("value"))
+                                    change = new_value - initial_value
+                                    total_offset += offset
+                                    
+                                    if change == 0: # If no change, increase the move offset
+                                        offset += 5
+                                    else:
+                                        logger.info(f"{slider_name} slider value changed to {new_value}")
+                                except MoveTargetOutOfBoundsException:
+                                    # If the move is out of bounds, reduce the offset and try again
+                                    offset -= 5
+                                    offset = max(offset, 1)
+                                except BaseException:
+                                    # If anything else goes wrong, stop trying
+                                    break
+                                iterations += 1
+                            
+                            if change != 0 and new_value != desired_value:
+                                # Calculate the required move to set the value to the desired_value
+                                total_move = direction_multiplier * (desired_value - initial_value) * (total_offset / change)
+                                try:
+                                    actions.move_to_element(slider_handle).click_and_hold().move_by_offset(
+                                        total_move if is_horizontal else 0,
+                                        -total_move if not is_horizontal else 0).release().perform()
+                                except:
+                                    pass
+                                
+                                # Check value after the move and adjust if necessary
+                                final_value = int(slider_handle.get_attribute("value"))
+                                logger.info(f"{slider_name} slider final value is {final_value}, offset {total_offset}, change {change}")
+                                while (final_value != desired_value) and (iterations < max_iterations):
+                                    try:
+                                        if direction_multiplier == 1:
+                                            adjustment_offset = total_offset * direction_multiplier if final_value < desired_value else 0
+                                        else:
+                                            adjustment_offset = total_offset * direction_multiplier if final_value > desired_value else 0
+                                        if adjustment_offset == 0:
+                                            break
+                                        actions.move_to_element(slider_handle).click_and_hold().move_by_offset(
+                                            adjustment_offset if is_horizontal else 0,
+                                            -adjustment_offset if not is_horizontal else 0).release().perform()
+                                        new_final_value = int(slider_handle.get_attribute("value"))
+                                        if final_value != new_final_value:
+                                            logger.info(f"{slider_name} slider final value adjusted to {new_final_value}")
+                                            final_value = new_final_value
+                                    except:
+                                        pass
+                                    iterations += 1                                
+
+                    try:
+                        top_left_slider = find_element_safe(By.XPATH, "//input[@type='range' and starts-with(@aria-label, 'top left corner')]")
+                        top_right_slider = find_element_safe(By.XPATH, "//input[@type='range' and starts-with(@aria-label, 'top right corner')]")
+                        bottom_right_slider = find_element_safe(By.XPATH, "//input[@type='range' and starts-with(@aria-label, 'bottom right corner')]")
+                        bottom_left_slider = find_element_safe(By.XPATH, "//input[@type='range' and starts-with(@aria-label, 'bottom left corner')]")
+                        
+                        if top_left_slider and bottom_right_slider and top_right_slider and bottom_left_slider:
+                            adjust_slider("top left", top_left_slider, 0, -1, True)  # move top left corner to the left
+                            adjust_slider("bottom right", bottom_right_slider, 100, 1, True)  # move bottom right corner to the right
+                            adjust_slider("bottom left", bottom_left_slider, 0, -1, False)  # move bottom left corner to the bottom
+                            adjust_slider("top right", top_right_slider, 100, 1, False) # move top right corner to the top
+                    except:
+                        pass
+                    
                     if not self.click_button_until_disappears("Find image source", "//button[.//div[text()='Find image source']]"):
                         raise Exception('Could not click on the "Find image source" button')
                     time.sleep(random.uniform(2.0, 3.0))
