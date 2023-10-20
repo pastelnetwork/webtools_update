@@ -81,7 +81,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.20"
+WEBTOOLS_VERSION = "1.21"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
@@ -561,7 +561,7 @@ class ChromeDriver:
             True if the tab was closed gracefully, False otherwise.
         """
         is_closed = False
-        close_timeout_secs = 7 # chrome tab gracefull close timeout in secs
+        close_timeout_secs = 8 # chrome tab gracefull close timeout in secs
         
         def close_driver_tab():
             try:
@@ -586,9 +586,15 @@ class ChromeDriver:
         if not is_closed:
             try:
                 if self.kill_new_renderer_processes(prev_client_id_to_pid):
-                    # close current tab
-                    self.driver.close()
-                    is_closed = True
+                    # close current tab - it may hang after new renderer processes were killed
+                    close_tab_thread = threading.Thread(target=close_driver_tab)
+                    close_tab_thread.start()
+                    close_tab_thread.join(timeout=close_timeout_secs / 2)
+                    
+                    if close_tab_thread.is_alive():
+                        logger.error(f'After killing new renderer processes still failed to close chrome tab in {close_timeout_secs / 2} secs')
+                    else:
+                        is_closed = True
             except Exception as exc:
                 logger.error(f"Failed to safely close the chrome tab. {str(exc)}")
                 pass
