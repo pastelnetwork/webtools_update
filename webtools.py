@@ -6,6 +6,7 @@ import os
 import time
 import socket
 import shutil
+from enum import Enum, auto
 import urllib.request
 import re
 import random
@@ -59,6 +60,7 @@ from utils import (
     walk_child_processes,
     cleanup_old_files,
     kill_process,
+    kill_process_tree,
     is_port_in_use,
 )
 from dupe_detection_params import (
@@ -81,7 +83,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.21"
+WEBTOOLS_VERSION = "1.22"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
@@ -94,6 +96,7 @@ GOOGLE_LENS_RESULT_PAGE_TIMEOUT = 35
 class TimeoutException(Exception):
     def __init__(self, msg=''):
         self.msg = msg
+        
 
 @contextmanager
 def time_limit(seconds, msg=''):
@@ -421,11 +424,24 @@ class ChromeDriver:
         }
         chrome_options.add_experimental_option("prefs", prefs)
         self.resized_image_save_path = None
-        chrome_service = ChromeService(executable_path=dd_params.chromedriver_path, service_args=chrome_service_args)
+        self.img = img
+        logger.info(f'Initialized webtools v{WEBTOOLS_VERSION}')
+        self.driver = None
+        self.chrome_options = chrome_options
+        self.chrome_service_args = chrome_service_args
+        self.start_chrome()
+
+
+    def start_chrome(self):
+        logger.info(f'Starting ChromeDriver...')
+        chrome_service = ChromeService(executable_path=self.dd_params.chromedriver_path,
+                                       service_args=self.chrome_service_args)
         for i in range(3):
             try:
-                self.driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
-                logger.info(f'Initialized ChromeDriver v{self.driver.capabilities["browserVersion"]}')
+                self.driver = webdriver.Chrome(service=chrome_service,
+                                               options=self.chrome_options)
+                self.chromedriver_pid = self.driver.service.process.pid
+                logger.info(f'Initialized ChromeDriver v{self.driver.capabilities["browserVersion"]}, pid={self.chromedriver_pid}')
                 break
             except Exception as e:
                 logger.exception(f'Error initializing ChromeDriver, attempt #{i + 1}. {e}')
@@ -435,25 +451,39 @@ class ChromeDriver:
             self.driver.set_page_load_timeout(10)
             # Set a timeout in secs for scripts
             self.driver.set_script_timeout(30)
-
-        self.img = img
-        logger.info(f'Initialized webtools v{WEBTOOLS_VERSION}')
-
+        
 
     def __del__(self):
         self.close()        
 
-        
+
     def check_task_cancelled(self):
         if self.dd_params.is_task_cancelled():
             raise TaskCancelledError(f"Dupe Detection Task [{self.dd_params.task_id}] cancelled.")
 
         
+    def reopen(self, task_id: int, need_open_new_tab: bool = False):
+        logger.info(f'[{task_id}] ChromeDriver hanged and will be reopened...')
+        close_driver_thread = threading.Thread(target=self.close)
+        close_driver_thread.start()
+        close_driver_thread.join(timeout=10)
+        
+        #if close_driver_thread.is_alive():
+        self.driver = None
+        logger.info(f'[{task_id}] ChromeDriver close thread is still alive. Killing the process {self.chromedriver_pid}...')
+        kill_process_tree(self.chromedriver_pid)
+       
+        self.start_chrome()
+        if need_open_new_tab:
+            self.open_new_tab(task_id)
+            
+               
     def close(self):
         if self.driver:
             try:
-                logger.info(f'Closing ChromeDriver...')
+                logger.info('Closing ChromeDriver...')
                 self.driver.quit()
+                self.driver = None
             except:
                 pass
        
@@ -549,7 +579,7 @@ class ChromeDriver:
         return is_renderer_processes_killed
 
 
-    def driver_safe_close_current_tab(self, prev_client_id_to_pid: Optional[Dict[int, int]]) -> bool:
+    def driver_safe_close_current_tab(self, task_id: int, prev_client_id_to_pid: Optional[Dict[int, int]]) -> bool:
         """
         Close the current tab in the browser.
         Tries to close the tab gracefully, if it fails, kills new chrome renderer processes.
@@ -558,16 +588,16 @@ class ChromeDriver:
             prev_client_id_to_pid: dict of renderer client IDs to process IDs before the tab was opened.
         
         Returns:
-            True if the tab was closed gracefully, False otherwise.
+            True if the tab was closed successfully, False otherwise.
         """
-        is_closed = False
+        is_closed: bool = False
         close_timeout_secs = 8 # chrome tab gracefull close timeout in secs
         
         def close_driver_tab():
             try:
                 self.driver.close()
             except Exception as exc:
-                logger.error(f"Failed to safely close the chrome tab. {str(exc)}")
+                logger.error(f"[{task_id}] failed to safely close the chrome tab. {str(exc)}")
                 pass
 
         # try first to close tab gracefully
@@ -577,7 +607,7 @@ class ChromeDriver:
         
         if close_tab_thread.is_alive():
             # close tab thread is still alive
-            logger.error(f'Chrome tab close timeout ({close_timeout_secs} secs) exceeded. Killing new chrome renderer processes...')
+            logger.error(f'[{task_id}] Chrome tab close timeout ({close_timeout_secs} secs) exceeded. Killing new chrome renderer processes...')
         else:
             is_closed = True
             
@@ -592,24 +622,27 @@ class ChromeDriver:
                     close_tab_thread.join(timeout=close_timeout_secs / 2)
                     
                     if close_tab_thread.is_alive():
-                        logger.error(f'After killing new renderer processes still failed to close chrome tab in {close_timeout_secs / 2} secs')
+                        logger.error(f'[{task_id}] after killing new renderer processes still failed to close chrome tab in {close_timeout_secs / 2} secs')
+                        self.reopen(task_id)
                     else:
                         is_closed = True
+                        logger.info(f'[{task_id}] closed chrome tab after killing new renderer processes')
             except Exception as exc:
-                logger.error(f"Failed to safely close the chrome tab. {str(exc)}")
+                logger.error(f"[{task_id}] failed to safely close the chrome tab. {str(exc)}")
                 pass
         
         return is_closed
 
 
-    def open_new_tab(self, get_task_id: int) -> bool:
+    def open_new_tab(self, task_id: int) -> bool:
         try:
             self.driver.switch_to.new_window('tab')
-            logger.info(f' [{get_task_id}] opened new Chrome tab...')
+            logger.info(f' [{task_id}] opened new Chrome tab...')
             return True
         except Exception as exc:
-            logger.error(f' [{get_task_id}] error opening new Chrome tab. {str(exc)}')
+            logger.error(f' [{task_id}] error opening new Chrome tab. {str(exc)}')
             return False
+
 
     VALIDATE_URL_LOAD_TIME: bool = False        
 
@@ -640,9 +673,7 @@ class ChromeDriver:
                 time.sleep(random.uniform(1.5, 2.5))
                 underlying_url_html = self.driver_retrieve_url_data(get_task_id, input_url, METADATA_URL_LOAD_TIMEOUT_SECS)
                 time.sleep(random.uniform(1.5, 2.5))
-                if not self.driver_safe_close_current_tab(client_id_to_pid):
-                    self.open_new_tab(get_task_id) # to replace killed tab
-                else:
+                if self.driver_safe_close_current_tab(get_task_id, client_id_to_pid):
                     self.driver.switch_to.window(current_window_handle)    
                 is_new_tab_opened = False
                 if corresponding_description_string:
@@ -655,9 +686,7 @@ class ChromeDriver:
             except Exception as e:
                 logger.info(f' [{get_task_id}] could not retrieve additional metadata for [{input_url}]. {str(e)}')
                 if is_new_tab_opened:
-                    if not self.driver_safe_close_current_tab(client_id_to_pid):
-                        self.open_new_tab(get_task_id) # to replace killed tab
-                    else:
+                    if self.driver_safe_close_current_tab(get_task_id, client_id_to_pid):
                         self.driver.switch_to.window(current_window_handle)
         else:
             logger.info(f' [{get_task_id}] could not retrieve additional metadata for [{input_url}]. Page load time may exceed {timeout_in_secs} seconds.')
@@ -1085,7 +1114,7 @@ class ChromeDriver:
                             
                             if change != 0 and new_value != desired_value:
                                 # Calculate the required move to set the value to the desired_value
-                                total_move = direction_multiplier * (desired_value - initial_value) * (total_offset / change)
+                                total_move = direction_multiplier * (desired_value - new_value) * (total_offset / change)
                                 try:
                                     actions.move_to_element(slider_handle).click_and_hold().move_by_offset(
                                         total_move if is_horizontal else 0,
