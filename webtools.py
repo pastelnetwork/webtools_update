@@ -6,7 +6,6 @@ import os
 import time
 import socket
 import shutil
-from enum import Enum, auto
 import urllib.request
 import re
 import random
@@ -62,6 +61,7 @@ from utils import (
     kill_process,
     kill_process_tree,
     is_port_in_use,
+    cleanup_chrome_user_data_dir,
 )
 from dupe_detection_params import (
     DupeDetectionTaskParams,
@@ -83,7 +83,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.22"
+WEBTOOLS_VERSION = "1.23"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
@@ -472,6 +472,7 @@ class ChromeDriver:
         self.driver = None
         logger.info(f'[{task_id}] ChromeDriver close thread is still alive. Killing the process {self.chromedriver_pid}...')
         kill_process_tree(self.chromedriver_pid)
+        cleanup_chrome_user_data_dir(self.dd_params.chrome_user_data_dir)
        
         self.start_chrome()
         if need_open_new_tab:
