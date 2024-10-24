@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2023 The Pastel Core developers
+# Copyright (c) 2021-2024 The Pastel Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://www.opensource.org/licenses/mit-license.php.
 from typing import Dict, Tuple, List, Optional
@@ -9,20 +9,19 @@ import shutil
 import urllib.request
 import re
 import random
-import json
-import gc
-import asyncio
-import nest_asyncio
-nest_asyncio.apply() # patch asyncio to allow nested event loops
 import httpx
 import threading
 from urllib.parse import quote
-import threading
 from datetime import datetime, timedelta
 import datefinder
 from html.parser import HTMLParser
 from contextlib import contextmanager
 import _thread
+import json
+import gc
+import asyncio
+import nest_asyncio
+nest_asyncio.apply() # patch asyncio to allow nested event loops
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -61,6 +60,7 @@ from utils import (
     kill_process,
     kill_process_tree,
     is_port_in_use,
+    is_running_in_docker,
     cleanup_chrome_user_data_dir,
 )
 from dupe_detection_params import (
@@ -83,7 +83,7 @@ CLIENT_ID = "689300e61c28cc7"
 CLIENT_SECRET = "6c45e31ca3201a2d8ee6709d99b76d249615a10c"
 im = pyimgur.Imgur(CLIENT_ID, CLIENT_SECRET)
 
-WEBTOOLS_VERSION = "1.23"
+WEBTOOLS_VERSION = "1.24"
 DEBUG_TIME_LIMIT_SECS = 900
 METADATA_DOWNLOAD_TIMEOUT_SECS = 120
 METADATA_DOWNLOAD_MAX_WORKERS = 15
@@ -96,7 +96,7 @@ GOOGLE_LENS_RESULT_PAGE_TIMEOUT = 35
 class TimeoutException(Exception):
     def __init__(self, msg=''):
         self.msg = msg
-        
+
 
 @contextmanager
 def time_limit(seconds, msg=''):
@@ -241,7 +241,7 @@ async def get_all_images_on_page_as_base64_encoded_strings(get_task_id: int, htm
                                                      max_results_to_collect: int = MAX_SEARCH_RESULTS) -> Tuple[List[str], List[str]]:
     soup = BeautifulSoup(html_of_page, "lxml")
     img_elements = soup.find_all("img")
-    
+
     image_urls = { img_src for img in img_elements if (img_src := img.get("src")) and img_src.startswith(("http://", "https://")) }
     logger.info(f' [{get_task_id}] found {len(image_urls)} distinct img elements on the page')
     if not image_urls:
@@ -249,7 +249,7 @@ async def get_all_images_on_page_as_base64_encoded_strings(get_task_id: int, htm
 
     list_of_base64_encoded_images = []
     list_of_corresponsing_image_urls = []
-    
+
     timer = Timer(start_timer=True)
     httpx_timeout_config = httpx.Timeout((5.0, timeout_in_secs))  # connect=5.0, read=timeout_in_secs
     total_image_count = len(image_urls)
@@ -263,10 +263,10 @@ async def get_all_images_on_page_as_base64_encoded_strings(get_task_id: int, htm
                 is_timeout = True
                 break
             image_urls_chunk = {image_urls.pop() for _ in range(min(chunk_size, len(image_urls)))}
-            
+
             tasks = [get_image_url_data(client, url, min_image_size_to_retrieve) for url in image_urls_chunk]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
             for result in results:
                 if isinstance(result, Exception):
                     continue
@@ -282,7 +282,7 @@ async def get_all_images_on_page_as_base64_encoded_strings(get_task_id: int, htm
                         f' Collected images: {len(list_of_base64_encoded_images)}')
             if is_max_results_reached:
                 break
-            
+
     if image_urls:  # URLs that were never processed
         urls_string = '\n'.join(image_urls)
         if is_max_results_reached:
@@ -292,7 +292,7 @@ async def get_all_images_on_page_as_base64_encoded_strings(get_task_id: int, htm
         else:
             reason = ''
         logger.info(f' [{get_task_id}] images ({len(image_urls)}) were not processed{reason}:\n{urls_string}')
-            
+
     return list_of_base64_encoded_images, list_of_corresponsing_image_urls
 
 
@@ -306,7 +306,7 @@ def extract_corresponding_description_string_from_input_title_string_func(input_
         list_of_found_description_strings = [str(x.string) for x in soup.find_all('div') if x.has_attr('data-sncf')]
     except:
         list_of_found_description_strings = ["" for x in list_of_found_title_strings]
-        
+
     if len(list_of_found_title_strings) > 0:
         for idx, current_found_title_string in enumerate(list_of_found_title_strings):
             input_title_string_trimmed = input_title_string[0:45]
@@ -344,21 +344,21 @@ def get_fields_from_image_search_result(current_result):
                     title = div_subitem["data-item-title"]
                     if original_url is None or original_url == '':
                         original_url = div_subitem.get("data-action-url")
-                        
+
         if original_url is None or original_url == '':
             original_url = current_soup.get("data-action-url")
 
         current_img_element = current_soup.find("img", {"aria-hidden": "true"})
         if current_img_element:
             img_url = current_img_element["src"]
-            
+
         resolution_pattern = r"(\d+)x(\d+)"
         resolution_match = re.search(resolution_pattern, str(current_result))
         if resolution_match:
             resolution = resolution_match.group(0)
     except Exception as exc:
         logger.info(f"Error parsing image result: {str(exc)}")
-    
+
     img_src = ''
     if img_url:
         try:
@@ -369,12 +369,12 @@ def get_fields_from_image_search_result(current_result):
         title = ''
     if not original_url:
         original_url = ''
-            
+
     return title, original_url, img_src, resolution
 
 
 class ChromeDriver:
-    
+
     def __init__(self, img: DDImage, dd_params: DupeDetectionTaskParams):
         self.dd_params = dd_params
         self.devtools_port = dd_params.chrome_devtools_port
@@ -390,9 +390,9 @@ class ChromeDriver:
         chrome_options = ChromeOptions()
         if not CONFIG.debug_chrome_driver_headless_mode:
             chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--disable-dev-shm-usage")
+        if is_running_in_docker():
+            chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--window-size=1920,1200")
-        chrome_options.add_argument("--disable-gpu")
         # chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--start-maximized")
         chrome_options.add_argument("--disable-backgrounding-occluded-windows")
@@ -423,6 +423,8 @@ class ChromeDriver:
             "profile.default_content_setting_values.automatic_downloads": 2,
         }
         chrome_options.add_experimental_option("prefs", prefs)
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option("useAutomationExtension", False)
         self.resized_image_save_path = None
         self.img = img
         logger.info(f'Initialized webtools v{WEBTOOLS_VERSION}')
@@ -451,34 +453,34 @@ class ChromeDriver:
             self.driver.set_page_load_timeout(10)
             # Set a timeout in secs for scripts
             self.driver.set_script_timeout(30)
-        
+
 
     def __del__(self):
-        self.close()        
+        self.close()
 
 
     def check_task_cancelled(self):
         if self.dd_params.is_task_cancelled():
             raise TaskCancelledError(f"Dupe Detection Task [{self.dd_params.task_id}] cancelled.")
 
-        
+
     def reopen(self, task_id: int, need_open_new_tab: bool = False):
         logger.info(f'[{task_id}] ChromeDriver hanged and will be reopened...')
         close_driver_thread = threading.Thread(target=self.close)
         close_driver_thread.start()
         close_driver_thread.join(timeout=10)
-        
+
         #if close_driver_thread.is_alive():
         self.driver = None
         logger.info(f'[{task_id}] ChromeDriver close thread is still alive. Killing the process {self.chromedriver_pid}...')
         kill_process_tree(self.chromedriver_pid)
         cleanup_chrome_user_data_dir(self.dd_params.chrome_user_data_dir)
-       
+
         self.start_chrome()
         if need_open_new_tab:
             self.open_new_tab(task_id)
-            
-               
+
+
     def close(self):
         if self.driver:
             try:
@@ -487,8 +489,8 @@ class ChromeDriver:
                 self.driver = None
             except:
                 pass
-       
-       
+
+
     def wait_for_page_loaded(self, id: int = None, query_url: str = None, timeout_in_secs: int = 10):
         # wait for Ajax calls to complete
         log_prefix = f' [{id}]' if id else ''
@@ -527,8 +529,8 @@ class ChromeDriver:
         # If the thread is still active after timeout, raise an exception.
         if thread.is_alive():
             raise TimeoutException(f"Timeout ({timeout_in_secs} secs) exceeded for URL [{query_url}]")
-        
-       
+
+
     def driver_retrieve_url_data(self, id: int, query_url: str, timeout_in_secs: int = 10) -> str:
         self.driver_get_with_timeout(id, query_url, timeout_in_secs)
         page_source_data = self.driver.page_source
@@ -544,14 +546,14 @@ class ChromeDriver:
         """
         # Filter for renderer processes
         filter_fn = lambda args: '--type=renderer' in args
-        
+
         client_id_to_pid = {}
         def extract_renderer_id(pid, args):
             # Extract the renderer client ID from the process arguments
             match = re.search(r'--renderer-client-id=(\d+)', ' '.join(args))
             if match:
                 client_id_to_pid[int(match.group(1))] = pid            
-                
+
         walk_child_processes(self.driver.service.process.pid, filter_fn, extract_renderer_id)
         return client_id_to_pid
 
@@ -560,12 +562,12 @@ class ChromeDriver:
         is_renderer_processes_killed = False
         try:
             client_id_to_pid = self.collect_renderer_ids()
-            
+
             # find new renderer processes
             new_client_id_to_pid = {client_id: pid for client_id, pid in client_id_to_pid.items() if client_id not in prev_client_id_to_pid}
             if len(new_client_id_to_pid) > 0:
                 logger.info(f'Found new chrome renderer processes: {new_client_id_to_pid}')
-            
+
                 # Kill the process associated with the highest renderer client ID
                 for client_id, pid in new_client_id_to_pid.items():
                     kill_process(pid)
@@ -573,10 +575,10 @@ class ChromeDriver:
                 is_renderer_processes_killed = True
             else:
                 logger.info(f'No new chrome renderer processes found')
-                
+
         except Exception as exc:
             logger.error(f'Error while killing the last renderer process: {str(exc)}')
-            
+
         return is_renderer_processes_killed
 
 
@@ -593,7 +595,7 @@ class ChromeDriver:
         """
         is_closed: bool = False
         close_timeout_secs = 8 # chrome tab gracefull close timeout in secs
-        
+
         def close_driver_tab():
             try:
                 self.driver.close()
@@ -605,13 +607,13 @@ class ChromeDriver:
         close_tab_thread = threading.Thread(target=close_driver_tab)
         close_tab_thread.start()
         close_tab_thread.join(timeout=close_timeout_secs)
-        
+
         if close_tab_thread.is_alive():
             # close tab thread is still alive
             logger.error(f'[{task_id}] Chrome tab close timeout ({close_timeout_secs} secs) exceeded. Killing new chrome renderer processes...')
         else:
             is_closed = True
-            
+
         # kill new renderer processes to stop any pending operations
         # after that it should successfully close the tab
         if not is_closed:
@@ -621,7 +623,7 @@ class ChromeDriver:
                     close_tab_thread = threading.Thread(target=close_driver_tab)
                     close_tab_thread.start()
                     close_tab_thread.join(timeout=close_timeout_secs / 2)
-                    
+
                     if close_tab_thread.is_alive():
                         logger.error(f'[{task_id}] after killing new renderer processes still failed to close chrome tab in {close_timeout_secs / 2} secs')
                         self.reopen(task_id)
@@ -631,7 +633,7 @@ class ChromeDriver:
             except Exception as exc:
                 logger.error(f"[{task_id}] failed to safely close the chrome tab. {str(exc)}")
                 pass
-        
+
         return is_closed
 
 
@@ -655,7 +657,7 @@ class ChromeDriver:
         list_of_base64_encoded_images = []
         list_of_corresponsing_image_urls = []
         is_page_can_be_loaded = asyncio.run(validate_url_load_time(input_url, timeout_in_secs / 2)) if self.VALIDATE_URL_LOAD_TIME else True
-            
+
         is_new_tab_opened = False
         if is_page_can_be_loaded:
             current_window_handle = self.driver.current_window_handle
@@ -720,7 +722,7 @@ class ChromeDriver:
                      'misc_related_image_url',
                      'misc_related_image_as_b64_string'],
             index=pd.Index([], name='search_result_ranking'))
-        
+
         timer = Timer(True)
         images_hashes = set()
         current_index = 0
@@ -786,7 +788,7 @@ class ChromeDriver:
                 indices_to_keep = indices_to_keep[:MAX_RESULTS_TO_RETURN]
                 rare_on_internet__similarity_df = rare_on_internet__similarity_df.head(MAX_RESULTS_TO_RETURN)
                 rare_on_internet__adjacency_df = rare_on_internet__adjacency_df.head(MAX_RESULTS_TO_RETURN)
-                
+
             filtered_combined_summary_df = combined_summary_df.loc[indices_to_keep]
             # reset index to be sequential 
             filtered_combined_summary_df.reset_index(drop=True, inplace=True)
@@ -837,7 +839,7 @@ class ChromeDriver:
         except Exception as exc:
             is_loaded = False
         return is_loaded
-    
+
 
     def extract_data_from_google_lens_page_func(self):
         list_of_images_as_base64__filtered = []
@@ -933,25 +935,76 @@ class ChromeDriver:
             return dict_of_google_lens_results_as_json
 
 
+    def click_button_by_text(self, button_text: str, element_type: str = "button", is_required: bool = False) -> bool:
+        """
+        Click a button or span element containing specific text.
+        
+        Args:
+            button_text: The text to search for in the button
+            element_type: Type of element to search for ("button" or "span")
+            is_required: If True, logs warnings when button is not found/clicked. If False, uses info level
+        
+        Returns:
+            bool: True if button was successfully clicked, False otherwise
+        """
+        try:
+            if element_type == "button":
+                xpath = f"//button[contains(text(), '{button_text}')]"
+            else:
+                xpath = f"//{element_type}[contains(text(), '{button_text}')]"
+                
+            buttons = self.driver.find_elements(By.XPATH, xpath)
+            if len(buttons) > 0:
+                for current_button in buttons:
+                    try:
+                        actions = ActionChains(self.driver)
+                        actions.move_to_element(current_button)
+                        actions.click(on_element=current_button)
+                        actions.perform()
+                        logger.info(f"Successfully clicked '{button_text}' {element_type}")
+                        time.sleep(random.uniform(0.1, 0.2))
+                        return True
+                    except BaseException as e:
+                        if is_required:
+                            logger.warning(f"Failed to click required '{button_text}' {element_type}: {str(e)}")
+                        return False
+            return False
+        except Exception as e:
+            if is_required:
+                logger.warning(f"Error with required '{button_text}' {element_type}: {str(e)}")
+            return False
+    
+    
     def click_button_until_disappears(self, name: str, xpath: str, max_attempts: int = 10) -> bool:
+        """
+        Click a button until it disappears from the page.
+        
+        Args:
+            name: Name of the button for logging
+            xpath: XPath to the button element
+            max_attempts: Maximum number of attempts to click the button
+            
+        Returns:
+            bool: True if button was successfully clicked and disappeared, False otherwise
+        """
         logger.info(f"Attempting to click '{name}' button...")
         for attempt in range(max_attempts):
             try:
                 wait = WebDriverWait(self.driver, 10) # wait up to 10 seconds
                 button_element = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
-                
+
                 # Scroll the button into view
                 self.driver.execute_script("arguments[0].scrollIntoView();", button_element)
-                
+
                 # Click the button using JavaScript
                 self.driver.execute_script("arguments[0].click();", button_element)
-                
+
                 # Wait for page to load after click
                 wait.until(lambda driver: driver.execute_script('return document.readyState') == 'complete')                
-                
+
                 # Create a BeautifulSoup object from the current page source
                 current_soup = BeautifulSoup(self.driver.page_source, "lxml")
-                
+
                 # Check if the button text still exists in the page
                 if current_soup.body(text=xpath):
                     logger.info(f"Button '{name}' text still exists after click, attempt {attempt + 1}")
@@ -964,8 +1017,123 @@ class ChromeDriver:
                 time.sleep(random.uniform(0.5, 1.2))
         logger.info(f"Failed to click the button '{name}' after {max_attempts} attempts")
         return False
-    
-    
+
+
+    def adjust_slider(slider_name: str, slider_handle, desired_value: int, direction_multiplier: int, is_horizontal: bool):
+        """
+        Adjust a slider element to a desired value.
+        
+        Args:
+            slider_name: Name of the slider for logging
+            slider_handle: The slider element to adjust
+            desired_value: The target value to set the slider to
+            direction_multiplier: Multiplier for direction of movement (-1 or 1)
+            is_horizontal: True if the slider is horizontal, False if vertical
+        """
+        if not slider_handle:
+            return
+
+        max_iterations = 50
+        # Get the initial value of the slider
+        initial_value = int(slider_handle.get_attribute("value"))
+        current_value = initial_value
+
+        # Check if the slider is already at exact desired value
+        if current_value == desired_value:
+            logger.info(f"{slider_name} slider already at target {desired_value}")
+            return
+
+        # Only adjust if necessary
+        if (direction_multiplier == 1 and initial_value < desired_value) or \
+            (direction_multiplier == -1 and initial_value > desired_value):
+            logger.info(f"Adjusting {slider_name} slider from {initial_value} to {desired_value}")
+
+            offset = 10 # initial conservative offset
+            total_offset = 0 # total offset applied
+            iterations = 0 # safety check - counter for number of iterations
+
+            while iterations < max_iterations:
+                try:
+                    # Calculate movement direction based on current value and desired value
+                    current_direction = 1 if desired_value > current_value else -1
+
+                    # Calculate the gap to target
+                    value_gap = abs(desired_value - current_value)
+
+                    if value_gap == 0:
+                        break
+
+                    # For initial movement, be very conservative if starting value is close to target
+                    if iterations == 0 and abs(current_value - desired_value) < 4:
+                        offset = 3  # Use minimal offset for fine adjustment
+                    else:
+                        # Adjust offset based on gap and previous movement
+                        if value_gap > 50:
+                            offset = min(100, offset * 2)  # Be more aggressive for large gaps
+                        elif value_gap > 20:
+                            offset = min(50, offset * 1.5)
+
+                    # Apply the move
+                    move_offset = offset * current_direction * direction_multiplier
+                    actions.move_to_element(slider_handle).click_and_hold().move_by_offset(
+                        move_offset if is_horizontal else 0,
+                        -move_offset if not is_horizontal else 0
+                    ).release().perform()
+
+                    # Get new value and check progress
+                    new_value = int(slider_handle.get_attribute("value"))
+                    value_change = new_value - current_value
+                    
+                    # If value moved in wrong direction, reverse our approach
+                    if (value_change > 0 and desired_value < current_value) or \
+                        (value_change < 0 and desired_value > current_value):
+                        direction_multiplier *= -1
+                        offset = max(3, offset * 0.5)  # Reduce offset and try again
+                        logger.info(f"{slider_name} slider moved wrong direction, adjusting approach")
+                    elif value_change == 0:
+                        # If no movement, increase offset more aggressively based on remaining gap
+                        if value_gap > 50:
+                            offset = min(150, offset * 2.5)
+                        else:
+                            offset = min(150, offset * 2)                                        
+                    else:
+                        logger.info(f"{slider_name} slider value changed to {new_value}")
+                        # If we moved but still have far to go, calculate better offset
+                        if abs(desired_value - new_value) > 20 and abs(value_change) < 10:
+                            # Movement was too small relative to remaining distance
+                            offset = min(150, offset * 3)
+                        else:
+                            # Calculate proportional movement but be more aggressive
+                            movement_ratio = abs(value_change / offset)
+                            remaining_gap = abs(desired_value - new_value)
+                            if movement_ratio > 0:
+                                # Be more aggressive when far from target
+                                aggression_factor = 1.5 if remaining_gap > 20 else 1.2
+                                offset = min(150, (remaining_gap / movement_ratio) * aggression_factor)
+                            else:
+                                offset = min(150, offset * 1.5)
+                    current_value = new_value
+                    total_offset += offset
+
+                except MoveTargetOutOfBoundsException:
+                    # If we hit bounds, reduce offset significantly and reverse direction
+                    offset = max(5, offset * 0.3)
+                    direction_multiplier *= -1
+                    logger.info(f"{slider_name} slider hit bounds, reducing offset to {offset}")
+                except BaseException as e:
+                    logger.warning(f"Error adjusting {slider_name} slider: {str(e)}")
+                    break
+
+                iterations += 1
+
+            # Log final status
+            final_value = int(slider_handle.get_attribute("value"))
+            if final_value == desired_value:
+                logger.info(f"{slider_name} slider reached target value {desired_value}")
+            else:
+                logger.info(f"{slider_name} slider final value is {final_value}, target was {desired_value}")
+
+
     def search_google_image_search_for_image(self) -> bool:
         is_succeeded = False
         try:
@@ -977,45 +1145,12 @@ class ChromeDriver:
                     google_reverse_image_search_base_url = 'https://www.google.com/imghp?hl=en'
                     self.driver.get(google_reverse_image_search_base_url)
                     time.sleep(random.uniform(1.2, 2.5))
-                    list_of_annoying_buttons = self.driver.find_elements(By.XPATH, "//button[contains(text(), 'No thanks')]")
-                    if len(list_of_annoying_buttons) > 0:
-                        for current_button in list_of_annoying_buttons:
-                            try:
-                                actions = ActionChains(self.driver)
-                                actions.move_to_element(current_button)
-                                actions.perform()
-                                current_button.click()
-                                logger.info('Had to click -No Thanks- button when asked to login to a Google account. Done successfully.')
-                            except BaseException as e:
-                                logger.exception('Could not click on the -No Thanks- button')
-                    try:
-                        buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'I agree')]")
-                        if len(buttons) > 0:
-                            for current_button in buttons:
-                                try:
-                                    actions = ActionChains(self.driver)
-                                    actions.move_to_element(current_button)
-                                    actions.perform()
-                                    current_button.click()
-                                    logger.info('Had to click -I Agree- button. Done successfully.')
-                                except BaseException as e:
-                                    logger.exception('Could not click on the -I Agree- button')
-                    except:
-                        pass
-                    try:
-                        buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Accept all')]")
-                        if len(buttons) > 0:
-                            for current_button in buttons:
-                                try:
-                                    actions = ActionChains(self.driver)
-                                    actions.move_to_element(current_button)
-                                    actions.perform()
-                                    current_button.click()
-                                    logger.info('Had to click -Accept all- button. Done successfully.')
-                                except BaseException as e:
-                                    logger.exception('Could not click on the -Accept all- button')
-                    except:
-                        pass
+
+                    # Handle optional dialog buttons
+                    self.click_button_by_text('No thanks')
+                    self.click_button_by_text('I agree')
+                    self.click_button_by_text('Accept all')                    
+
                     logger.info('Trying to select "Search by Image" button...')
                     wait = WebDriverWait(self.driver, 10) # wait up to 10 seconds
                     search_by_image_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "[aria-label='Search by image']")))
@@ -1036,7 +1171,7 @@ class ChromeDriver:
                         file_selector.send_keys(str(resized_image_save_path))
                         time.sleep(random.uniform(0.2, 0.4))
                         logger.info('...sent file path to file selector control!')
-                    except:                    
+                    except Exception as e:
                         logger.info('Trying to click the "upload a file" button...')
                         button_xpath = "//span[@role='button' and contains(text(), 'upload a file')]"
                         list_of_buttons = self.driver.find_elements(By.XPATH, button_xpath)
@@ -1064,101 +1199,29 @@ class ChromeDriver:
                                 except:
                                     pass
                     time.sleep(random.uniform(2.5, 5))
-                   
+
                     def find_element_safe(by, value):
                         try:
                             return self.driver.find_element(by, value)
                         except NoSuchElementException:
                             return None
-                        
-                    def adjust_slider(slider_name: str, slider_handle, desired_value: int, direction_multiplier: int, is_horizontal: bool):
-                        if not slider_handle:
-                            return
-                        
-                        max_iterations = 30
-                        # Get the initial value of the slider
-                        initial_value = int(slider_handle.get_attribute("value"))
-                        new_value = initial_value
-                        
-                        # Only adjust if necessary
-                        if (direction_multiplier == 1 and initial_value < desired_value) or (direction_multiplier == -1 and initial_value > desired_value):
-                            logger.info(f"Adjusting {slider_name} slider from {initial_value} to {desired_value}")
-                            offset = 10 # initial offset
-                            total_offset = 0 # total offset applied
-                            change = 0
-                            iterations = 0 # safety check - counter for number of iterations
-                            
-                            while change == 0 and iterations < max_iterations:
-                                try:                            
-                                    # Try a small move to see how much the value changes
-                                    actions.move_to_element(slider_handle).click_and_hold().move_by_offset(
-                                        offset * direction_multiplier if is_horizontal else 0,
-                                        -offset * direction_multiplier if not is_horizontal else 0).release().perform()
-                            
-                                    # Get the changed value
-                                    new_value = int(slider_handle.get_attribute("value"))
-                                    change = new_value - initial_value
-                                    total_offset += offset
-                                    
-                                    if change == 0: # If no change, increase the move offset
-                                        offset += 5
-                                    else:
-                                        logger.info(f"{slider_name} slider value changed to {new_value}")
-                                except MoveTargetOutOfBoundsException:
-                                    # If the move is out of bounds, reduce the offset and try again
-                                    offset -= 5
-                                    offset = max(offset, 1)
-                                except BaseException:
-                                    # If anything else goes wrong, stop trying
-                                    break
-                                iterations += 1
-                            
-                            if change != 0 and new_value != desired_value:
-                                # Calculate the required move to set the value to the desired_value
-                                total_move = direction_multiplier * (desired_value - new_value) * (total_offset / change)
-                                try:
-                                    actions.move_to_element(slider_handle).click_and_hold().move_by_offset(
-                                        total_move if is_horizontal else 0,
-                                        -total_move if not is_horizontal else 0).release().perform()
-                                except:
-                                    pass
-                                
-                                # Check value after the move and adjust if necessary
-                                final_value = int(slider_handle.get_attribute("value"))
-                                logger.info(f"{slider_name} slider final value is {final_value}, offset {total_offset}, change {change}")
-                                while (final_value != desired_value) and (iterations < max_iterations):
-                                    try:
-                                        if direction_multiplier == 1:
-                                            adjustment_offset = total_offset * direction_multiplier if final_value < desired_value else 0
-                                        else:
-                                            adjustment_offset = total_offset * direction_multiplier if final_value > desired_value else 0
-                                        if adjustment_offset == 0:
-                                            break
-                                        actions.move_to_element(slider_handle).click_and_hold().move_by_offset(
-                                            adjustment_offset if is_horizontal else 0,
-                                            -adjustment_offset if not is_horizontal else 0).release().perform()
-                                        new_final_value = int(slider_handle.get_attribute("value"))
-                                        if final_value != new_final_value:
-                                            logger.info(f"{slider_name} slider final value adjusted to {new_final_value}")
-                                            final_value = new_final_value
-                                    except:
-                                        pass
-                                    iterations += 1                                
 
                     try:
                         top_left_slider = find_element_safe(By.XPATH, "//input[@type='range' and starts-with(@aria-label, 'top left corner')]")
                         top_right_slider = find_element_safe(By.XPATH, "//input[@type='range' and starts-with(@aria-label, 'top right corner')]")
                         bottom_right_slider = find_element_safe(By.XPATH, "//input[@type='range' and starts-with(@aria-label, 'bottom right corner')]")
                         bottom_left_slider = find_element_safe(By.XPATH, "//input[@type='range' and starts-with(@aria-label, 'bottom left corner')]")
-                        
+
                         if top_left_slider and bottom_right_slider and top_right_slider and bottom_left_slider:
-                            adjust_slider("top left", top_left_slider, 0, -1, True)  # move top left corner to the left
-                            adjust_slider("bottom right", bottom_right_slider, 100, 1, True)  # move bottom right corner to the right
-                            adjust_slider("bottom left", bottom_left_slider, 0, -1, False)  # move bottom left corner to the bottom
-                            adjust_slider("top right", top_right_slider, 100, 1, False) # move top right corner to the top
+                            # horizontal sliders
+                            self.adjust_slider("top left", top_left_slider, 0, -1, True)  # move top left corner to the left
+                            self.adjust_slider("bottom right", bottom_right_slider, 100, 1, True)  # move bottom right corner to the right
+                            # vertical sliders
+                            self.adjust_slider("bottom left", bottom_left_slider, 100, 1, False)  # move bottom left corner to the bottom
+                            self.adjust_slider("top right", top_right_slider, 0, -1, False) # move top right corner to the top
                     except:
                         pass
-                    
+
                     if not self.click_button_until_disappears("Find image source", "//button[.//div[text()='Find image source']]"):
                         raise Exception('Could not click on the "Find image source" button')
                     time.sleep(random.uniform(2.0, 3.0))
@@ -1207,98 +1270,49 @@ class ChromeDriver:
                 google_lens_base_url = 'https://lens.google.com/search?p='
                 self.driver.get(google_lens_base_url)
                 time.sleep(random.uniform(1.2, 2.5))
-                list_of_annoying_buttons = self.driver.find_elements(By.XPATH, "//button[contains(text(), 'No thanks')]")
-                if len(list_of_annoying_buttons) > 0:
-                    for current_button in list_of_annoying_buttons:
-                        try:
-                            actions = ActionChains(self.driver)
-                            actions.move_to_element(current_button)
-                            actions.perform()
-                            current_button.click()
-                            logger.info('Had to click -No Thanks- button when asked to login to a Google account. Done successfully.')
-                        except BaseException as e:
-                            logger.info('Could not click on the -No Thanks- button. Error message: ' + str(e))
-                try:
-                    buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'I agree')]")
-                    if len(buttons) > 0:
-                        buttons[0].click()
-                        logger.info('Had to click -I agree- box. Done successfully.')
-                except:
-                    pass
-                try:
-                    buttons = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Accept all')]")
-                    if len(buttons) > 0:
-                        for current_button in buttons:
-                            try:
-                                actions = ActionChains(self.driver)
-                                actions.move_to_element(current_button)
-                                actions.perform()
-                                current_button.click()
-                                logger.info('Had to click -Accept all- button. Done successfully.')
-                            except BaseException as e:
-                                logger.info('Could not click on the -Accept all- button. Error message: ' + str(e))
-                except:
-                    pass
+
+                # Handle optional dialog buttons
+                self.click_button_by_text('No thanks')
+                self.click_button_by_text('I agree')
+                self.click_button_by_text('Accept all')
                 time.sleep(random.uniform(0.3, 0.6))
-                list_of_annoying_buttons = self.driver.find_elements(By.XPATH, "//button[contains(text(), 'No thanks')]")
-                if len(list_of_annoying_buttons) > 0:
-                    for current_button in list_of_annoying_buttons:
-                        try:
-                            actions = ActionChains(self.driver)
-                            actions.move_to_element(current_button)
-                            actions.click(on_element=current_button)
-                            actions.perform()
-                            logger.info('Had to click -No Thanks- button when asked to login to a Google account. Done successfully.')
-                        except BaseException as e:
-                            logger.info('Could not click on the -No Thanks- button. Error message: ' + str(e))
+                # Second attempt for delayed popups
+                self.click_button_by_text('No thanks')
                 time.sleep(random.uniform(0.5, 3))
-                
-                
-                logger.info('Now trying to click the Upload button...')
-                list_of_buttons = self.driver.find_elements(By.XPATH, "//span[contains(text(), 'Upload')]")
-                if len(list_of_buttons) > 0:
-                    for current_button in list_of_buttons:
-                        try:
-                            actions = ActionChains(self.driver)
-                            actions.move_to_element(current_button)
-                            actions.click(on_element=current_button)
-                            actions.perform()
-                            logger.info('Successfully clicked Upload button!')
-                            time.sleep(random.uniform(0.1, 0.2))
-                        except:
-                            pass
-                        
-                logger.info('Now trying to click the Computer button...')
-                list_of_buttons = self.driver.find_elements(By.XPATH, "//span[contains(text(), 'Computer')]")
-                if len(list_of_buttons) > 0:
-                    for current_button in list_of_buttons:
-                        try:
-                            actions = ActionChains(self.driver)
-                            actions.move_to_element(current_button)
-                            actions.click(on_element=current_button)
-                            actions.perform()
-                            logger.info('Successfully clicked Computer button!')
-                            time.sleep(random.uniform(0.1, 0.2))
-                        except:
-                            pass
-                time.sleep(random.uniform(0.5, 1.0))
+
+                # Click required buttons for upload flow
+                logger.info('Initiating upload process...')
+                if not self.click_button_by_text('Upload', 'span', is_required=True):
+                    logger.info('Upload button not found or not clickable')
+                else:
+                    time.sleep(random.uniform(0.2, 0.4))
+
+                if not self.click_button_by_text('Computer', 'span', is_required=True):
+                    logger.info('Computer button not found or not clickable')
+                else:
+                    time.sleep(random.uniform(0.5, 1.0))
+
                 choose_file_button_element = self.driver.find_element(By.XPATH, "//input[@type='file']")
                 if choose_file_button_element:
                     logger.info('Found file input element')
                 self.driver.execute_script("arguments[0].style.display = 'block';", choose_file_button_element)
+                time.sleep(random.uniform(0.2, 0.4))
+
                 # count "a" elements before we send image path
                 logger.info('Parsing original search page with BeautifulSoup...')
-                soup = BeautifulSoup(self.driver.page_source, "lxml")    
+                soup = BeautifulSoup(self.driver.page_source, "lxml")
                 logger.info('Done parsing page!')
                 a_elements = [x for x in soup.find_all('a') if x.has_attr('aria-label') ]
                 a_elements_count = len(a_elements)
                 logger.info(f'Found {a_elements_count} <a> elements on the page')
-                
+
                 choose_file_button_element.send_keys(str(resized_image_save_path))
+                time.sleep(random.uniform(0.2, 0.4))
+
                 status_result = 1
             except BaseException as e:
                 logger.exception('Problem getting Google lens data')
-        return status_result, resized_image_save_path, a_elements_count
+        return status_result, str(resized_image_save_path), a_elements_count
 
 
     def get_list_of_similar_images_func(self):
